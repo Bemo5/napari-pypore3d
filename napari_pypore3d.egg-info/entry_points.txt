@@ -1,0 +1,2 @@
+[napari.manifest]
+napari-pypore3d = napari_pypore3d:napari.yaml

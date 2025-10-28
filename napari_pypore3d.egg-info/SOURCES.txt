@@ -1,0 +1,11 @@
+pyproject.toml
+napari_pypore3d/__init__.py
+napari_pypore3d/_widget.py
+napari_pypore3d/napari.yaml
+napari_pypore3d/readers.py
+napari_pypore3d.egg-info/PKG-INFO
+napari_pypore3d.egg-info/SOURCES.txt
+napari_pypore3d.egg-info/dependency_links.txt
+napari_pypore3d.egg-info/entry_points.txt
+napari_pypore3d.egg-info/requires.txt
+napari_pypore3d.egg-info/top_level.txt

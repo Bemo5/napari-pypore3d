@@ -1,0 +1,20 @@
+name: napari-pypore3d
+display_name: PyPore3D Tools
+contributions:
+  commands:
+    - id: napari-pypore3d.raw_widget
+      title: RAW Loader & 2D/3D Toggle (PyPore3D Tools)
+      python_name: napari_pypore3d._widget:raw_loader_widget
+    - id: napari-pypore3d.read_raw
+      title: Read RAW/BIN with shape in filename
+      python_name: napari_pypore3d.readers:napari_get_reader
+
+  widgets:
+    - command: napari-pypore3d.raw_widget
+      display_name: RAW Loader & 2D/3D Toggle (PyPore3D Tools)
+      autogenerate: false
+
+  readers:
+    - command: napari-pypore3d.read_raw
+      filename_patterns: ["*.raw", "*.RAW", "*.bin"]
+      accepts_directories: false

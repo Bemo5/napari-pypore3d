@@ -1,0 +1,3 @@
+napari>=0.5
+magicgui>=0.8
+numpy

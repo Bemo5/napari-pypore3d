@@ -1,0 +1,12 @@
+[project]
+name = "napari-pypore3d"
+version = "0.0.1"
+requires-python = ">=3.9"
+dependencies = [
+  "napari>=0.5",
+  "magicgui>=0.8",
+  "numpy",
+]
+
+[project.entry-points."napari.manifest"]
+napari-pypore3d = "napari_pypore3d:napari.yaml"
