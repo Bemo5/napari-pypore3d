@@ -65,7 +65,7 @@ napari==0.6.6
 napari-console==0.1.4
 napari-plugin-engine==0.2.0
 napari-plugin-manager==0.1.7
--e git+https://github.com/Bemo5/napari-pypore3d.git@eff1553478ae111686b9be202a2303d19099dee1#egg=napari_pypore3d
+-e git+https://github.com/Bemo5/napari-pypore3d.git@e0543e23ea7bdb07718f78d2c12d9936b7016f71#egg=napari_pypore3d
 napari-svg==0.2.1
 narwhals==2.5.0
 nest-asyncio==1.6.0
