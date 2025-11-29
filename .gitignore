@@ -16,3 +16,9 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Python cache / venv
+__pycache__/
+*.py[cod]
+.venv/.venv_backup_typemap/
+
