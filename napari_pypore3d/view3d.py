@@ -23,6 +23,12 @@ from napari.utils.notifications import show_warning, show_info
 # NOTE: reuse helpers and globals from _widget so behaviour stays identical
 from ._widget import _pad, _images, _apply_grid  # type: ignore[attr-defined]
 
+# Optional SciPy import for connected-components labelling
+try:
+    from scipy import ndimage as ndi
+except Exception:
+    ndi = None  # type: ignore[assignment]
+
 
 def _make_view3d_tab() -> QWidget:
     # local imports so top-level stays unchanged
@@ -43,20 +49,22 @@ def _make_view3d_tab() -> QWidget:
         ttl.setStyleSheet("font-weight:600;")
         lay.addWidget(ttl)
         lay.addWidget(inner)
-        box.setStyleSheet("""
+        box.setStyleSheet(
+            """
             QFrame#card {
                 border: 1px solid #4a4a4a;
                 border-radius: 10px;
                 background-color: rgba(255,255,255,0.03);
             }
-        """)
+        """
+        )
         return box
 
     # ---------- Active viewer controls (apply to selected image) ----------
     btn_toggle = PushButton(text="Toggle 2D ↔ 3D")
     mode = ComboBox(choices=["mip", "attenuated_mip", "iso"], value="mip")
-    att  = FloatSpinBox(value=0.01, min=0.01, max=0.50, step=0.01)
-    iso  = FloatSpinBox(value=0.50, min=0.00, max=1.00, step=0.01)
+    att = FloatSpinBox(value=0.01, min=0.01, max=0.50, step=0.01)
+    iso = FloatSpinBox(value=0.50, min=0.00, max=1.00, step=0.01)
 
     for w in (btn_toggle.native, mode.native, att.native, iso.native):
         try:
@@ -136,17 +144,19 @@ def _make_view3d_tab() -> QWidget:
     lst = QListWidget()
     try:
         if QAbstractItemView is not None:
-            lst.setSelectionMode(QAbstractItemView.ExtendedSelection)  # type: ignore[arg-type]
+            lst.setSelectionMode(
+                QAbstractItemView.ExtendedSelection  # type: ignore[arg-type]
+            )
         lst.setMinimumHeight(360)
     except Exception:
         pass
 
     link_z = CheckBox(text="Link Z", value=True)
-    btn_open_mirror  = PushButton(text="Open 3D mirror (selected)")
+    btn_open_mirror = PushButton(text="Open 3D mirror (selected)")
     btn_close_mirror = PushButton(text="Close mirror")
-    btn_sel_active   = PushButton(text="Select active")
-    btn_sel_all      = PushButton(text="Select all")
-    btn_clear_sel    = PushButton(text="Clear")
+    btn_sel_active = PushButton(text="Select active")
+    btn_sel_all = PushButton(text="Select all")
+    btn_clear_sel = PushButton(text="Clear")
     for w in (
         btn_open_mirror.native,
         btn_close_mirror.native,
@@ -228,6 +238,7 @@ def _make_view3d_tab() -> QWidget:
                             d.contrast_limits = s.contrast_limits
                         except Exception:
                             pass
+
                     return _cb
 
                 try:
@@ -382,7 +393,7 @@ def _make_view3d_tab() -> QWidget:
         shp = tuple(int(s) for s in np.asarray(img.data).shape)
 
         try:
-            raw = np.fromfile(path, dtype=np.uint8)  # labels: 0,1,2,...
+            raw = np.fromfile(path, dtype=np.uint8)
         except Exception as e:
             show_warning(f"Failed to load segmentation: {e}")
             return
@@ -396,14 +407,35 @@ def _make_view3d_tab() -> QWidget:
 
         seg = raw.reshape(shp)
 
+        # ---------- NEW: turn binary mask into instance labels ----------
+        if ndi is None:
+            # no SciPy → just show what we have as labels
+            labels = seg.astype(np.int32, copy=False)
+            n = int(labels.max())
+            show_warning(
+                "SciPy is not installed – showing raw labels.\n"
+                "Run `pip install scipy` in this environment for per-object labelling."
+            )
+        else:
+            vals = np.unique(seg)
+            vals = vals[vals != 0]  # ignore background
+            if vals.size <= 1:
+                # looks binary (0 / 1) → connected components in 3D
+                labels, n = ndi.label(seg > 0)
+            else:
+                # already labelled (0,1,2,3,…) → just use as-is
+                labels = seg.astype(np.int32, copy=False)
+                n = int(labels.max())
+
         v.add_labels(
-            seg,
-            name=f"{img.name} [seg]",
+            labels,
+            name=f"{img.name} [seg_cc {n}]",
             blending="translucent",
-            opacity=1.0,
+            opacity=0.7,
+            rendering="iso_categorical",
         )
 
-        show_info("Segmentation loaded as a Labels layer.")
+        show_info(f"Segmentation loaded with {n} connected component(s).")
 
     seg_btn.changed.connect(_load_segmentation)
 
@@ -416,13 +448,15 @@ def _make_view3d_tab() -> QWidget:
     seg_title.setStyleSheet("font-weight:600;")
     seg_lay.addWidget(seg_title)
     seg_lay.addWidget(seg_btn.native)
-    seg_box.setStyleSheet("""
+    seg_box.setStyleSheet(
+        """
         QFrame#seg_card {
             border: 1px solid #4a4a4a;
             border-radius: 10px;
             background-color: rgba(255,255,255,0.03);
         }
-    """)
+    """
+    )
 
     pv.addWidget(seg_box)
     pv.addStretch(1)
