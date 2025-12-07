@@ -773,33 +773,60 @@ def raw_loader_widget() -> QWidget:
     show_info(PLUGIN_BUILD)
 
     tabs = QTabWidget()
+
+    # --- Load tab (always built) ---
     ui = _LoadUI(s)
-    tabs.addTab(ui.widget, "Load")
+    load_tab = ui.widget
+    load_tab_index = tabs.addTab(load_tab, "Load")
 
+    # --- Crop / Tools tab (eager, usually cheap) ---
     _, crop_panel = make_crop_panel()
-    tabs.addTab(_pad(crop_panel), "Crop / Tools")
+    crop_tab = _pad(crop_panel)
+    crop_tab_index = tabs.addTab(crop_tab, "Crop / Tools")
 
-    # NEW: intra-volume slice comparison
+    # --- Slice compare tab (eager) ---
     _, slice_panel = make_slice_compare_panel()
-    tabs.addTab(_pad(slice_panel), "Slice compare")
+    slice_tab = _pad(slice_panel)
+    slice_tab_index = tabs.addTab(slice_tab, "Slice compare")
 
-    # 3D View tab moved to a separate module to keep _widget.py cleaner
+    # --- 3D View tab (eager, kept as separate module) ---
     from .view3d import _make_view3d_tab
-    tabs.addTab(_make_view3d_tab(), "3D View")
+    view3d_tab = _make_view3d_tab()
+    view3d_tab_index = tabs.addTab(view3d_tab, "3D View")
 
-    plotlab = PlotLab(s)
-    tabs.addTab(_pad(plotlab.as_qwidget()), "Plot Lab")
+    # ------------------------------------------------------------------
+    # HEAVY TABS: Plot Lab / Info / Export / Functions → LAZY BUILT
+    # ------------------------------------------------------------------
+    # Placeholders with simple layouts; filled on first activation.
+    plot_tab = QWidget()
+    plot_tab_layout = QVBoxLayout(plot_tab)
+    plot_tab_layout.setContentsMargins(0, 0, 0, 0)
+    plot_tab_layout.setSpacing(0)
+    plot_tab_index = tabs.addTab(plot_tab, "Plot Lab")
 
-    info_widget, info_refresh = build_info_export_panel(s)
-    tabs.addTab(_pad(info_widget), "Info / Export")
+    info_tab = QWidget()
+    info_tab_layout = QVBoxLayout(info_tab)
+    info_tab_layout.setContentsMargins(0, 0, 0, 0)
+    info_tab_layout.setSpacing(0)
+    info_tab_index = tabs.addTab(info_tab, "Info / Export")
 
-    try:
-        fn_page = functions_widget()               # magicgui Container
-        fn_qwidget = fn_page.native if hasattr(fn_page, "native") else fn_page
-        tabs.addTab(_pad(fn_qwidget), "Functions")
-    except Exception as e:
-        show_warning(f"Functions page failed to build: {e!r}")
+    fn_tab = QWidget()
+    fn_tab_layout = QVBoxLayout(fn_tab)
+    fn_tab_layout.setContentsMargins(0, 0, 0, 0)
+    fn_tab_layout.setSpacing(0)
+    fn_tab_index = tabs.addTab(fn_tab, "Functions")
 
+    # Lazy-built objects + flags
+    plotlab = None
+    info_widget = None
+    info_refresh = lambda: None  # stub until real one is built
+    fn_page = None
+
+    built_plot = False
+    built_info = False
+    built_fn = False
+
+    # --- outer wrapper (scroll etc.) ---
     outer = QWidget()
     pl = QVBoxLayout(outer)
     pl.setContentsMargins(0, 0, 0, 0)
@@ -807,51 +834,121 @@ def raw_loader_widget() -> QWidget:
     pl.addWidget(tabs)
     wrapper = _wrap_scroll(outer)
 
-    cap_width(
-        getattr(s, "dock_max_width", _MIN_DOCK_WIDTH),
-        info_widget=info_widget,
-        plotlab_widget=plotlab,
-        crop_panel=crop_panel,
-        tabs=tabs,
-        wrapper=wrapper,
-    )
+    # Helper to re-apply width caps whenever we add a heavy widget
+    def _apply_cap_width():
+        try:
+            cap_width(
+                getattr(s, "dock_max_width", _MIN_DOCK_WIDTH),
+                info_widget=info_widget,
+                plotlab_widget=plotlab,
+                crop_panel=crop_panel,
+                tabs=tabs,
+                wrapper=wrapper,
+            )
+        except Exception:
+            # helpers fallback no-ops are fine; don't crash the plugin
+            pass
 
+    # --- lazy builders for heavy tabs --------------------------------
+    def _ensure_plotlab():
+        nonlocal plotlab, built_plot
+        if built_plot:
+            return
+        try:
+            plotlab_local = PlotLab(s)
+            w = _pad(plotlab_local.as_qwidget())
+            plot_tab_layout.addWidget(w)
+            plotlab = plotlab_local
+            built_plot = True
+            _apply_cap_width()
+        except Exception as e:
+            show_warning(f"Plot Lab failed to build: {e!r}")
+
+    def _ensure_info():
+        nonlocal info_widget, info_refresh, built_info
+        if built_info:
+            return
+        try:
+            info_w, info_ref = build_info_export_panel(s)
+            info_widget_local = info_w
+            info_refresh_local = info_ref
+            info_tab_layout.addWidget(_pad(info_widget_local))
+            info_widget = info_widget_local
+            info_refresh = info_refresh_local
+            built_info = True
+            _apply_cap_width()
+        except Exception as e:
+            show_warning(f"Info / Export page failed to build: {e!r}")
+
+    def _ensure_functions():
+        nonlocal fn_page, built_fn
+        if built_fn:
+            return
+        try:
+            fn_pg = functions_widget()  # magicgui Container
+            fn_qwidget = fn_pg.native if hasattr(fn_pg, "native") else fn_pg
+            fn_tab_layout.addWidget(_pad(fn_qwidget))
+            fn_page = fn_pg
+            built_fn = True
+        except Exception as e:
+            show_warning(f"Functions page failed to build: {e!r}")
+
+    # Ensure the correct heavy tab is built when user switches tabs
+    def _on_tab_changed(idx: int):
+        if idx == plot_tab_index:
+            _ensure_plotlab()
+        elif idx == info_tab_index:
+            _ensure_info()
+        elif idx == fn_tab_index:
+            _ensure_functions()
+
+    tabs.currentChanged.connect(_on_tab_changed)
+
+    # Initial width cap (before heavy tabs exist, it's basically a no-op)
+    _apply_cap_width()
+
+    # ---------------- viewer wiring (very light) ----------------------
     v = current_viewer()
     if v:
         wire_caption_events_once()
 
         def _on_layers(event=None, *_):
-            # SUPER LIGHT: just refresh the list + info; no global _sync here.
+            # SUPER LIGHT: just refresh what belongs to the *active* tab.
             if _IN_SYNC:
                 return
-            ui._refresh_loaded_list()
-            try:
-                info_refresh()
-            except Exception:
-                pass
+
+            current = tabs.currentIndex()
+
+            # Only touch the loaded-list when the "Load" tab is active
+            if current == load_tab_index:
+                ui._refresh_loaded_list()
+
+            # Only build + recompute Info/Export when its tab is active
+            if current == info_tab_index:
+                if not built_info:
+                    _ensure_info()
+                try:
+                    info_refresh()
+                except Exception:
+                    pass
 
         # connect ONLY structural events to _on_layers
         v.layers.events.inserted.connect(_on_layers)
         v.layers.events.removed.connect(_on_layers)
         v.layers.events.reordered.connect(_on_layers)
-        # DO NOT connect layers.events.changed here – it fires all the time and
-        # used to force heavy work on every small update.
-        # v.layers.events.changed.connect(_on_layers)
+        # DO NOT connect layers.events.changed here – it fires all the time.
 
-        # ⚠️ IMPORTANT: no dims.current_step hook here anymore (it caused the crash + lag)
-        # If you *really* want grid updates on 3D toggle only, we can later add a safe hook.
-
-        # v.dims.events.current_step.connect(
-        #     lambda *_: (_update_dot_plane(v), _apply_grid(v))
-        # )
-        # v.dims.events.ndisplay.connect(lambda *_: _apply_grid(v))
+        # still no dims.current_step hooks (these caused crash/lag before)
 
         # captions react only to active-layer change (very cheap)
         v.layers.selection.events.active.connect(
             lambda *_: refresh_all_captions("bottom")
         )
 
-        # initial update
+        # initial update (respect active-tab gating)
         _on_layers()
+
+    return wrapper
+
 
     return wrapper
