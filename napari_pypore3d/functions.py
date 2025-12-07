@@ -133,13 +133,14 @@ def _fn_normal_export_sam_slice(layer: NapariImage) -> Optional[np.ndarray]:
     """
     Export a single slice + mask pair for SAM training.
 
-    - Uses the current image layer (this 'layer') as the CT slice source.
-    - Finds a matching Labels layer (brush mask).
-    - Uses the current Z index in the viewer for 3D data.
+    - Uses the given image layer as CT source.
+    - Finds a matching Labels layer.
+    - If 3D: prefers the single Z-slice that actually contains labels.
+      (If 0 or multiple labelled slices, falls back to viewer dims.)
     - Writes:
         <basename>_zXXXX_img.png
         <basename>_zXXXX_mask.png
-      (or without _zXXXX for 2D images).
+      (or without _zXXXX for 2D).
     """
     v = current_viewer()
     if v is None:
@@ -161,35 +162,47 @@ def _fn_normal_export_sam_slice(layer: NapariImage) -> Optional[np.ndarray]:
             f"Image and labels shapes differ: {img_data.shape} vs {lbl_data.shape}"
         )
 
-    # Get current Z index for 3D, or treat 2D as single slice
+    # ----------------------------------- pick slice -----------------------------------
     if img_data.ndim == 3:
-        # Find the axis that is currently controlled by a slider (not displayed)
-        try:
-            slider_axes = [ax for ax in range(img_data.ndim)
-                           if ax not in v.dims.displayed]
-            if slider_axes:
-                z_axis = slider_axes[0]
-            else:
-                z_axis = 0  # fallback
-            z_index = int(v.dims.current_step[z_axis])
-        except Exception:
-            z_axis = 0
-            z_index = 0
+        # 1) Prefer the Z where you actually painted something
+        label_any = np.any(lbl_data != 0, axis=(1, 2))  # (Z,)
+        nz = np.where(label_any)[0]
 
-        # clamp and take that slice
-        z_index = max(0, min(z_index, img_data.shape[z_axis] - 1))
+        if len(nz) == 1:
+            z_axis = 0
+            z_index = int(nz[0])
+        else:
+            # 2) fallback: use viewer dims
+            try:
+                slider_axes = [ax for ax in range(img_data.ndim)
+                               if ax not in v.dims.displayed]
+                if slider_axes:
+                    z_axis = slider_axes[0]
+                else:
+                    z_axis = 0
+                z_index = int(v.dims.current_step[z_axis])
+            except Exception:
+                z_axis = 0
+                z_index = 0
+
+            z_index = max(0, min(z_index, img_data.shape[z_axis] - 1))
+
         slicer = [slice(None)] * img_data.ndim
         slicer[z_axis] = z_index
         img_slice = img_data[tuple(slicer)]
         mask_slice = lbl_data[tuple(slicer)]
         z_suffix = f"_z{z_index:04d}"
+
+        show_info(
+            f"SAM export: using z={z_index} "
+            f"(label slices={len(nz)}; "
+            f"chosen axis={z_axis})")
     else:
         img_slice = img_data
         mask_slice = lbl_data
         z_suffix = ""
 
-
-    # Ask user where to save (we just use the base name)
+    # ----------------------------------- save files -----------------------------------
     suggested_name = f"{layer.name}{z_suffix}_sam.png"
     fname, _ = QFileDialog.getSaveFileName(
         None,
@@ -213,7 +226,8 @@ def _fn_normal_export_sam_slice(layer: NapariImage) -> Optional[np.ndarray]:
     Image.fromarray(mask_u8).save(mask_path)
 
     show_info(f"SAM slice exported:\n{img_path}\n{mask_path}")
-    return None  # no new layer; just side-effect on disk
+    return None
+
 
 
 @dataclass
