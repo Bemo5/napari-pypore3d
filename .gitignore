@@ -10,6 +10,8 @@ dist/
 .eggs/
 .ipynb_checkpoints/
 .cache/
+models/
+Images/
 # IDE
 .vscode/
 .idea/
