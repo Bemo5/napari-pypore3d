@@ -18,11 +18,10 @@ except Exception:
     TextEdit = None  # fallback later
 
 from napari import current_viewer
-from napari.layers import Image as NapariImage, Labels as NapariLabels  # <<< CHANGED
+from napari.layers import Image as NapariImage
 from napari.utils.notifications import show_info, show_warning, show_error
 import ctypes
-from qtpy.QtWidgets import QFileDialog  # <<< NEW
-from PIL import Image  # <<< NEW
+
 
 try:
     # IMPORTANT: use the *Python wrapper* module, not the low-level C one
@@ -86,147 +85,7 @@ def _add_result_layer(data: np.ndarray, base_name: str, suffix: str) -> None:
     safe_suffix = suffix.replace(" ", "_")
     name = f"{base_name}_{safe_suffix}"
     v.add_image(data, name=name)
-# --------------------------------------------------------------------- SAM helpers
-
-
-def _find_labels_for_image(image_layer: NapariImage) -> Optional[NapariLabels]:
-    """
-    Try to find a Labels layer that matches the given Image layer.
-
-    Strategy:
-      1) Look for Labels layers with identical data.shape.
-      2) If none, return the first Labels layer (if any).
-    """
-    v = current_viewer()
-    if v is None:
-        return None
-
-    labels_layers = [L for L in v.layers if isinstance(L, NapariLabels)]
-    if not labels_layers:
-        return None
-
-    # Prefer exact shape match
-    for L in labels_layers:
-        try:
-            if np.shape(L.data) == np.shape(image_layer.data):
-                return L
-        except Exception:
-            continue
-
-    # Fallback: first labels layer
-    return labels_layers[0]
-
-
-def _normalize_to_uint8(slice_arr: np.ndarray) -> np.ndarray:
-    """Normalize a 2D slice to uint8 [0, 255] for export."""
-    arr = np.asarray(slice_arr, dtype=np.float32)
-    mn = float(arr.min())
-    mx = float(arr.max())
-    if mx > mn:
-        arr = (arr - mn) / (mx - mn)
-    else:
-        arr = np.zeros_like(arr, dtype=np.float32)
-    return (arr * 255.0).clip(0, 255).astype(np.uint8)
-
-
-def _fn_normal_export_sam_slice(layer: NapariImage) -> Optional[np.ndarray]:
-    """
-    Export a single slice + mask pair for SAM training.
-
-    - Uses the given image layer as CT source.
-    - Finds a matching Labels layer.
-    - If 3D: prefers the single Z-slice that actually contains labels.
-      (If 0 or multiple labelled slices, falls back to viewer dims.)
-    - Writes:
-        <basename>_zXXXX_img.png
-        <basename>_zXXXX_mask.png
-      (or without _zXXXX for 2D).
-    """
-    v = current_viewer()
-    if v is None:
-        show_warning("No viewer found.")
-        return None
-
-    img_data = np.asarray(layer.data)
-    if img_data.ndim not in (2, 3):
-        raise ValueError(f"Expected 2D or 3D image, got shape {img_data.shape}")
-
-    labels_layer = _find_labels_for_image(layer)
-    if labels_layer is None:
-        show_warning("No matching Labels layer found for this image.")
-        return None
-
-    lbl_data = np.asarray(labels_layer.data)
-    if lbl_data.shape != img_data.shape:
-        raise ValueError(
-            f"Image and labels shapes differ: {img_data.shape} vs {lbl_data.shape}"
-        )
-
-    # ----------------------------------- pick slice -----------------------------------
-    if img_data.ndim == 3:
-        # 1) Prefer the Z where you actually painted something
-        label_any = np.any(lbl_data != 0, axis=(1, 2))  # (Z,)
-        nz = np.where(label_any)[0]
-
-        if len(nz) == 1:
-            z_axis = 0
-            z_index = int(nz[0])
-        else:
-            # 2) fallback: use viewer dims
-            try:
-                slider_axes = [ax for ax in range(img_data.ndim)
-                               if ax not in v.dims.displayed]
-                if slider_axes:
-                    z_axis = slider_axes[0]
-                else:
-                    z_axis = 0
-                z_index = int(v.dims.current_step[z_axis])
-            except Exception:
-                z_axis = 0
-                z_index = 0
-
-            z_index = max(0, min(z_index, img_data.shape[z_axis] - 1))
-
-        slicer = [slice(None)] * img_data.ndim
-        slicer[z_axis] = z_index
-        img_slice = img_data[tuple(slicer)]
-        mask_slice = lbl_data[tuple(slicer)]
-        z_suffix = f"_z{z_index:04d}"
-
-        show_info(
-            f"SAM export: using z={z_index} "
-            f"(label slices={len(nz)}; "
-            f"chosen axis={z_axis})")
-    else:
-        img_slice = img_data
-        mask_slice = lbl_data
-        z_suffix = ""
-
-    # ----------------------------------- save files -----------------------------------
-    suggested_name = f"{layer.name}{z_suffix}_sam.png"
-    fname, _ = QFileDialog.getSaveFileName(
-        None,
-        "Export SAM PNG+mask (base name)",
-        suggested_name,
-        "PNG (*.png);;All files (*)",
-    )
-    if not fname:
-        show_info("SAM export cancelled.")
-        return None
-
-    root, _ext = os.path.splitext(fname)
-
-    img_u8 = _normalize_to_uint8(img_slice)
-    mask_u8 = np.asarray(mask_slice, dtype=np.uint8)
-
-    img_path = root + "_img.png"
-    mask_path = root + "_mask.png"
-
-    Image.fromarray(img_u8).save(img_path)
-    Image.fromarray(mask_u8).save(mask_path)
-
-    show_info(f"SAM slice exported:\n{img_path}\n{mask_path}")
-    return None
+# --------------------------------------------------------------------- function entries
 
 
 
@@ -348,14 +207,6 @@ NORMAL_FUNCTIONS: Dict[str, FunctionEntry] = {
         label="Cast to uint8 (clipped)",
         runner=_fn_normal_cast_uint8,
         tooltip="Clip range to [0, 255] and cast to uint8.",
-    ),
-    "Export SAM slice PNG+mask": FunctionEntry(
-        label="Export SAM slice PNG+mask",
-        runner=_fn_normal_export_sam_slice,
-        tooltip=(
-            "Export the current slice as <base>_img.png and <base>_mask.png "
-            "for SAM training. Requires a matching Labels layer."
-        ),
     ),
 }
 

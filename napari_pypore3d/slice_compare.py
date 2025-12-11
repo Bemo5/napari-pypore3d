@@ -70,28 +70,66 @@ def _images(v) -> List[NapariImage]:
     return out
 
 
-def _safe_contrast(L: NapariImage):
+def _safe_contrast(
+    L: NapariImage,
+    parent: Optional[NapariImage] = None,
+    *,
+    keep_opacity: bool = False,
+):
+    """
+    Apply 'safe' contrast limits.
+
+    - If a parent is given, copy its contrast + colormap.
+    - Otherwise, approximate robust contrast from the layer's own data.
+    """
     try:
-        if hasattr(L, "reset_contrast_limits"):
-            L.reset_contrast_limits()
+        if parent is not None:
+            # Inherit from parent volume so slices look the same
+            try:
+                if hasattr(parent, "contrast_limits"):
+                    L.contrast_limits = tuple(parent.contrast_limits)
+            except Exception:
+                pass
+            try:
+                # try to reuse same colormap as parent
+                L.colormap = getattr(parent, "colormap", "gray")
+            except Exception:
+                pass
         else:
-            a = np.asarray(L.data, dtype=np.float32)
-            if a.size == 0:
-                return
-            step = max(1, a.size // 256_000)
-            flat = a.ravel()[::step]
-            lo, hi = np.nanpercentile(flat, [0.5, 99.5])
-            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                lo, hi = float(np.nanmin(flat)), float(np.nanmax(flat))
-            L.contrast_limits = (float(lo), float(hi))
+            # Fallback: percentiles on this layer's data
+            if hasattr(L, "reset_contrast_limits"):
+                L.reset_contrast_limits()
+            else:
+                a = np.asarray(L.data, dtype=np.float32)
+                if a.size > 0:
+                    step = max(1, a.size // 256_000)
+                    flat = a.ravel()[::step]
+                    lo, hi = np.nanpercentile(flat, [0.5, 99.5])
+                    if (
+                        not np.isfinite(lo)
+                        or not np.isfinite(hi)
+                        or hi <= lo
+                    ):
+                        lo = float(np.nanmin(flat))
+                        hi = float(np.nanmax(flat))
+                    # avoid completely degenerate [0,0] if possible
+                    if hi == lo:
+                        hi = lo + 1.0
+                    L.contrast_limits = (float(lo), float(hi))
+
         L.visible = True
-        L.opacity = 1.0
+        if not keep_opacity:
+            # don't override external opacity tweaks if we ask not to
+            L.opacity = getattr(L, "opacity", 1.0)
         try:
-            L.colormap = "gray"
+            if not hasattr(L, "colormap"):
+                L.colormap = "gray"
         except Exception:
             pass
     except Exception:
+        # never crash viewer because of contrast logic
         pass
+
 
 
 def _full_source(L: NapariImage) -> np.ndarray:
@@ -254,24 +292,43 @@ class SliceCompareController:
     # ------------------------------------------------------------------#
 
     def _sync_limits(self):
-        """Update spinbox ranges; always allow manual input."""
+        """Update spinbox ranges and clamp values to the current volume size."""
         L = self._target_layer()
         if not L:
             for sb in (self.z_spin, self.y_spin, self.x_spin):
                 sb.setRange(0, 2_000_000)
             return
+
         a = _full_source(L)
         if a.ndim < 3:
             for sb in (self.z_spin, self.y_spin, self.x_spin):
                 sb.setRange(0, 2_000_000)
             return
+
         z, y, x = last_zyx(a)
         sizes = [max(1, int(z)), max(1, int(y)), max(1, int(x))]
+
         for sb, size in zip((self.z_spin, self.y_spin, self.x_spin), sizes):
-            sb.setRange(0, size - 1)
-            # clamp current value so if user spammed 412124412 it becomes volume_max
-            cur = min(max(int(sb.value()), 0), size - 1)
-            sb.setValue(cur)
+            # valid indices = 0 ... size-1
+            max_idx = size - 1
+            sb.setRange(0, max_idx)
+
+            # 🔑 IMPORTANT: use raw text, not sb.value()
+            text = sb.text().strip()
+            try:
+                raw = int(text)
+            except Exception:
+                # fall back to whatever Qt parsed
+                raw = int(sb.value())
+
+            # clamp  e.g. 123123213 → 699 for a 700^3 volume
+            if raw < 0:
+                raw = 0
+            elif raw > max_idx:
+                raw = max_idx
+
+            sb.setValue(raw)
+
 
     def on_layers_changed(self):
         if self._busy:
@@ -398,7 +455,9 @@ class SliceCompareController:
             existing.metadata.update(meta)
             child = existing
 
-        _safe_contrast(child)
+        # inherit contrast/colormap from parent volume
+        _safe_contrast(child, parent=L)
+
         try:
             ensure_caption(child)
         except Exception:
@@ -432,7 +491,7 @@ class SliceCompareController:
             y = max(1, int(y))
             x = max(1, int(x))
 
-            # clamp typed values to [0, size-1] even if user spammed 412124412
+            # clamp typed values to [0, size-1] even if user spammed 66666
             zi = int(np.clip(int(self.z_spin.value()), 0, z - 1))
             yi = int(np.clip(int(self.y_spin.value()), 0, y - 1))
             xi = int(np.clip(int(self.x_spin.value()), 0, x - 1))
@@ -446,9 +505,10 @@ class SliceCompareController:
             lay_yz = self._ensure_plane(L, "YZ", xi)
 
             if lay_xy or lay_xz or lay_yz:
-                # hide the big 3D parent so only the 3 slices are visible
+                # keep parent 3D image visible (slightly dim)
                 try:
-                    L.visible = False
+                    L.visible = True
+                    L.opacity = 0.8
                 except Exception:
                     pass
 
@@ -489,6 +549,48 @@ class SliceCompareController:
             )
         finally:
             self._busy = False
+
+    def clear_views(self):
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            v = current_viewer()
+            if not v:
+                return
+            L = self._target_layer()
+            if not L:
+                return
+
+            # remove all orthogonal slice layers for this parent
+            to_remove: List[NapariImage] = []
+            for lay in [L2 for L2 in v.layers if isinstance(L2, NapariImage)]:
+                md = getattr(lay, "metadata", {}) or {}
+                if md.get("_slice_compare", False) and md.get("_slice_parent") == L.name:
+                    to_remove.append(lay)
+            for lay in to_remove:
+                try:
+                    v.layers.remove(lay)
+                except Exception:
+                    pass
+
+            # show parent 3D image again
+            try:
+                L.visible = True
+                _safe_contrast(L)
+            except Exception:
+                pass
+
+            _toggle_center_points(v, L.name, True)
+
+            # restore viewer layout (ndisplay, grid) so 3D lighting works again
+            self._restore_viewer_layout(v)
+
+            if to_remove:
+                show_info(f"Removed {len(to_remove)} orthogonal views for '{L.name}'.")
+        finally:
+            self._busy = False
+
 
     def clear_views(self):
         if self._busy:

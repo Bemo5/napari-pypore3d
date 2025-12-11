@@ -1,4 +1,4 @@
-# napari_pypore3d/info_export.py — r35
+# napari_pypore3d/info_export.py — r37
 # ---------------------------------------------------------------------
 # Info panel (shows active image details) + Export tools:
 #  • Save as .npy
@@ -11,7 +11,7 @@
 #     - Callable: refresh() to re-read active image & update fields
 #
 from __future__ import annotations
-from typing import Callable, Optional, Tuple, Dict
+from typing import Callable, Optional, Dict
 import pathlib
 import numpy as np
 
@@ -26,7 +26,6 @@ from napari.utils.notifications import show_info, show_warning, show_error
 
 # helpers from the package
 from .helpers import (
-    active_image,
     array_stats,
     voxel,
     export_raw_little,
@@ -94,6 +93,7 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
     """
     Create the Info / Export tab and a refresh() function.
     """
+
     # --- UI skeleton
     root = QWidget()
     root.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -137,17 +137,60 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
     # --------------------------------------------------------
     # behavior
     # --------------------------------------------------------
-    def _get_active() -> Optional[NapariImage]:
-        L, _ = active_image()
-        return L
+
+    def _clear_fields() -> None:
+        for lab in value_labels.values():
+            lab.setText("—")
+
+    def _find_image_layer() -> Optional[NapariImage]:
+        """
+        VERY dumb but very reliable:
+        - get current viewer
+        - return top-most Image layer if any
+        """
+        try:
+            viewer = current_viewer()
+        except Exception:
+            return None
+        if viewer is None:
+            return None
+
+        # Prefer active_layer if it's an Image
+        lyr = getattr(viewer, "active_layer", None)
+        if isinstance(lyr, NapariImage):
+            return lyr
+
+        # Otherwise pick the last Image layer (top-most)
+        for L in reversed(list(viewer.layers)):
+            if isinstance(L, NapariImage):
+                return L
+        return None
 
     def refresh() -> None:
-        L = _get_active()
-        if not L:
-            for lab in value_labels.values():
-                lab.setText("—")
+        try:
+            viewer = current_viewer()
+        except Exception:
+            viewer = None
+
+        if viewer is None:
+            _clear_fields()
+            value_labels["Layer"].setText("No viewer")
             return
-        info = _layer_summary(L)
+
+        L = _find_image_layer()
+        if not isinstance(L, NapariImage):
+            _clear_fields()
+            value_labels["Layer"].setText(f"No Image layer (total layers: {len(viewer.layers)})")
+            return
+
+        try:
+            info = _layer_summary(L)
+        except Exception as e:
+            _clear_fields()
+            value_labels["Layer"].setText(f"Error reading layer '{L.name}'")
+            show_warning(f"Info panel: failed to read layer '{L.name}': {e}")
+            return
+
         value_labels["Layer"].setText(info["name"])
         value_labels["Shape"].setText(info["shape"])
         value_labels["Dtype"].setText(info["dtype"])
@@ -161,7 +204,7 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
 
     def _pick_save_path(suffix: str, title: str) -> Optional[pathlib.Path]:
         default_dir = ""
-        L = _get_active()
+        L = _find_image_layer()
         if L:
             p = L.metadata.get("_file_path")
             if p:
@@ -175,9 +218,9 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
         return pathlib.Path(fn) if fn else None
 
     def _on_save_npy():
-        L = _get_active()
+        L = _find_image_layer()
         if not L:
-            show_warning("No active image.")
+            show_warning("Info / Export: no Image layer to save.")
             return
         path = _pick_save_path(".npy", "Save array as .npy")
         if not path:
@@ -191,9 +234,9 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
     def _on_save_tif():
         if not HAVE_TIFF:
             return
-        L = _get_active()
+        L = _find_image_layer()
         if not L:
-            show_warning("No active image.")
+            show_warning("Info / Export: no Image layer to save.")
             return
         path = _pick_save_path(".tif", "Save array as .tif")
         if not path:
@@ -206,9 +249,9 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
             show_error(f"TIFF save failed: {e}")
 
     def _on_save_raw():
-        L = _get_active()
+        L = _find_image_layer()
         if not L:
-            show_warning("No active image.")
+            show_warning("Info / Export: no Image layer to save.")
             return
         path = _pick_save_path(".raw", "Save array as .raw (little-endian)")
         if not path:
@@ -223,6 +266,25 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
     btn_npy.clicked.connect(_on_save_npy)
     btn_tif.clicked.connect(_on_save_tif)
     btn_raw.clicked.connect(_on_save_raw)
+
+    # --- auto-refresh on viewer events (best-effort)
+    try:
+        viewer = current_viewer()
+    except Exception:
+        viewer = None
+
+    if viewer is not None:
+        # active layer changed
+        try:
+            viewer.layers.selection.events.active.connect(lambda e=None: refresh())
+        except Exception:
+            pass
+        # layers added / removed
+        try:
+            viewer.layers.events.inserted.connect(lambda e=None: refresh())
+            viewer.layers.events.removed.connect(lambda e=None: refresh())
+        except Exception:
+            pass
 
     # initial paint
     refresh()
