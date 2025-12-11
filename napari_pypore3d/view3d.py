@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
-
+from skimage.filters import threshold_otsu, threshold_multiotsu
 from qtpy.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -14,6 +14,7 @@ from qtpy.QtWidgets import (
     QListWidgetItem,
     QFrame,
     QFileDialog,
+    QFormLayout,  # << added
 )
 from magicgui.widgets import PushButton, CheckBox, ComboBox, FloatSpinBox
 from napari import current_viewer
@@ -43,18 +44,18 @@ def _make_view3d_tab() -> QWidget:
         box.setObjectName("card")
         box.setFrameShape(QFrame.StyledPanel)
         lay = QVBoxLayout(box)
-        lay.setContentsMargins(16, 12, 16, 16)
-        lay.setSpacing(12)
+        lay.setContentsMargins(20, 16, 20, 20)
+        lay.setSpacing(16)
         ttl = QLabel(title)
-        ttl.setStyleSheet("font-weight:600;")
+        ttl.setStyleSheet("font-weight:600; font-size: 14px;")
         lay.addWidget(ttl)
         lay.addWidget(inner)
         box.setStyleSheet(
             """
             QFrame#card {
-                border: 1px solid #4a4a4a;
-                border-radius: 10px;
-                background-color: rgba(255,255,255,0.03);
+                border: 2px solid #5a5a5a;
+                border-radius: 12px;
+                background-color: rgba(255,255,255,0.05);
             }
         """
         )
@@ -68,13 +69,47 @@ def _make_view3d_tab() -> QWidget:
 
     for w in (btn_toggle.native, mode.native, att.native, iso.native):
         try:
-            w.setMinimumWidth(130)
+            w.setMinimumWidth(130)  # a bit smaller so they don't fight for width
+            w.setMinimumHeight(30)
         except Exception:
             pass
     try:
-        btn_toggle.native.setMinimumHeight(36)
+        btn_toggle.native.setMinimumHeight(40)
+        btn_toggle.native.setStyleSheet("font-weight: bold;")
     except Exception:
         pass
+
+    # Log widget for messages
+    log_text = QLabel("")
+    log_text.setWordWrap(True)
+    log_text.setMinimumHeight(100)
+    log_text.setStyleSheet(
+        """
+        QLabel {
+            background-color: rgba(0, 0, 0, 0.8);
+            color: #e0e0e0;
+            font-family: monospace;
+            font-size: 12px;
+            padding: 10px;
+            border-radius: 6px;
+            border: 1px solid #4a4a4a;
+        }
+    """
+    )
+
+    def _log_message(message: str):
+        """Add a timestamped message to the log."""
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        current_text = log_text.text()
+        new_text = f"[{timestamp}] {message}"
+        if current_text:
+            new_text = current_text + "\n" + new_text
+        log_text.setText(new_text)
+
+        # Auto-scroll to show latest
+        log_text.setAlignment(log_text.alignment() | 0x0080)  # AlignBottom
 
     def _toggle(*_):
         v = current_viewer()
@@ -82,6 +117,7 @@ def _make_view3d_tab() -> QWidget:
             return
         v.dims.ndisplay = 3 if v.dims.ndisplay == 2 else 2
         _apply_grid(v)
+        _log_message(f"Toggled display to {v.dims.ndisplay}D")
 
     btn_toggle.changed.connect(_toggle)
 
@@ -98,279 +134,55 @@ def _make_view3d_tab() -> QWidget:
                     setattr(lyr, k, val)
                 except Exception:
                     pass
+            _log_message(
+                f"Applied {mode.value} render with attenuation={att.value:.3f}, iso={iso.value:.3f}"
+            )
 
     mode.changed.connect(_apply_active)
     att.changed.connect(_apply_active)
     iso.changed.connect(_apply_active)
 
+    # row with the toggle button
     vc_row1 = QWidget()
     r1 = QHBoxLayout(vc_row1)
-    r1.setContentsMargins(0, 0, 0, 0)
-    r1.setSpacing(12)
+    r1.setContentsMargins(0, 4, 0, 4)
+    r1.setSpacing(20)
     r1.addWidget(btn_toggle.native)
     r1.addStretch(1)
 
+    # NEW: form-style layout for Render / Atten / Iso Thr → vertical, not scrunched
     vc_row2 = QWidget()
-    r2 = QHBoxLayout(vc_row2)
+    r2 = QFormLayout(vc_row2)
     r2.setContentsMargins(0, 0, 0, 0)
-    r2.setSpacing(14)
-    r2.addWidget(QLabel("render"))
-    r2.addWidget(mode.native)
-    r2.addWidget(QLabel("atten"))
-    r2.addWidget(att.native)
-    r2.addWidget(QLabel("iso_thr"))
-    r2.addWidget(iso.native)
-    r2.addStretch(1)
+    r2.setSpacing(8)
+    r2.addRow("Render:", mode.native)
+    r2.addRow("Atten:", att.native)
+    r2.addRow("Iso Thr:", iso.native)
 
     vc = QWidget()
     vcl = QVBoxLayout(vc)
     vcl.setContentsMargins(0, 0, 0, 0)
-    vcl.setSpacing(10)
+    vcl.setSpacing(12)
     vcl.addWidget(vc_row1)
     vcl.addWidget(vc_row2)
     viewer_card = _card("Active viewer (selected image)", vc)
 
-    # ---------- 3D Mirror (separate window) ----------
-    global _MIRROR_VIEWER, _MIRROR_LINKS
-    try:
-        _MIRROR_VIEWER  # type: ignore[name-defined]
-    except NameError:
-        _MIRROR_VIEWER = None  # type: ignore[assignment]
-    try:
-        _MIRROR_LINKS  # type: ignore[name-defined]
-    except NameError:
-        _MIRROR_LINKS = []  # type: ignore[assignment]
+    # ---------- Thresholding / Transfer Function ----------
+    thresh_low = FloatSpinBox(value=50.0, min=0.0, max=255.0, step=1.0)
+    thresh_high = FloatSpinBox(value=200.0, min=0.0, max=255.0, step=1.0)
 
-    lst = QListWidget()
-    try:
-        if QAbstractItemView is not None:
-            lst.setSelectionMode(
-                QAbstractItemView.ExtendedSelection  # type: ignore[arg-type]
-            )
-        lst.setMinimumHeight(360)
-    except Exception:
-        pass
-
-    link_z = CheckBox(text="Link Z", value=True)
-    btn_open_mirror = PushButton(text="Open 3D mirror (selected)")
-    btn_close_mirror = PushButton(text="Close mirror")
-    btn_sel_active = PushButton(text="Select active")
-    btn_sel_all = PushButton(text="Select all")
-    btn_clear_sel = PushButton(text="Clear")
-    for w in (
-        btn_open_mirror.native,
-        btn_close_mirror.native,
-        btn_sel_active.native,
-        btn_sel_all.native,
-        btn_clear_sel.native,
-    ):
+    for w in (thresh_low.native, thresh_high.native):
         try:
-            w.setMinimumHeight(32)
+            w.setMinimumWidth(120)
+            w.setMinimumHeight(30)
         except Exception:
             pass
 
-    def _refresh_list(select_active_if_empty=True):
-        lst.clear()
-        v = current_viewer()
-        if not v:
-            return
-        active = v.layers.selection.active
-        for L in _images(v):
-            it = QListWidgetItem(L.name, lst)
-            if select_active_if_empty and L is active:
-                it.setSelected(True)
+    btn_threshold = PushButton(text="Apply threshold & segment")
+    btn_threshold.native.setMinimumHeight(40)
+    btn_threshold.native.setStyleSheet("font-weight: bold;")
 
-    def _cleanup_links():
-        global _MIRROR_LINKS
-        for emitter, attr, cb in list(_MIRROR_LINKS):
-            try:
-                getattr(emitter, attr).disconnect(cb)
-            except Exception:
-                pass
-        _MIRROR_LINKS = []
-
-    def _open_mirror(*_):
-        global _MIRROR_VIEWER, _MIRROR_LINKS
-        v = current_viewer()
-        if not v:
-            return
-        try:
-            import napari as _napari
-        except Exception:
-            show_warning("Could not import napari for mirror window.")
-            return
-
-        chosen = {it.text() for it in lst.selectedItems()}
-        if not chosen:
-            show_warning("Pick one or more images in the list first.")
-            return
-
-        _cleanup_links()
-        if _MIRROR_VIEWER is None:
-            _MIRROR_VIEWER = _napari.Viewer()
-        else:
-            for L in list(_MIRROR_VIEWER.layers):
-                try:
-                    _MIRROR_VIEWER.layers.remove(L)
-                except Exception:
-                    pass
-
-        try:
-            _MIRROR_VIEWER.dims.ndisplay = 3
-        except Exception:
-            pass
-
-        for src in _images(v):
-            if src.name not in chosen:
-                continue
-            try:
-                dst = _MIRROR_VIEWER.add_image(
-                    src.data,
-                    name=src.name,
-                    colormap=getattr(src, "colormap", "gray"),
-                    contrast_limits=getattr(src, "contrast_limits", None),
-                    rendering=getattr(src, "rendering", "mip"),
-                )
-
-                def _mk_sync(s=src, d=dst):
-                    def _cb(*_):
-                        try:
-                            d.contrast_limits = s.contrast_limits
-                        except Exception:
-                            pass
-
-                    return _cb
-
-                try:
-                    cb = _mk_sync()
-                    src.events.contrast_limits.connect(cb)
-                    _MIRROR_LINKS.append((src.events, "contrast_limits", cb))
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        if bool(link_z.value):
-            def _src2mirror(*_):
-                try:
-                    _MIRROR_VIEWER.dims.set_current_step(0, v.dims.current_step[0])
-                except Exception:
-                    pass
-
-            def _mirror2src(*_):
-                try:
-                    v.dims.set_current_step(0, _MIRROR_VIEWER.dims.current_step[0])
-                except Exception:
-                    pass
-
-            try:
-                v.dims.events.current_step.connect(_src2mirror)
-                _MIRROR_LINKS.append((v.dims.events, "current_step", _src2mirror))
-            except Exception:
-                pass
-            try:
-                _MIRROR_VIEWER.dims.events.current_step.connect(_mirror2src)
-                _MIRROR_LINKS.append(
-                    (_MIRROR_VIEWER.dims.events, "current_step", _mirror2src)
-                )
-            except Exception:
-                pass
-
-        try:
-            _MIRROR_VIEWER.window._qt_window.raise_()
-        except Exception:
-            pass
-
-    def _close_mirror(*_):
-        global _MIRROR_VIEWER
-        _cleanup_links()
-        if _MIRROR_VIEWER is not None:
-            try:
-                _MIRROR_VIEWER.close()
-            except Exception:
-                pass
-        _MIRROR_VIEWER = None
-
-    def _select_active(*_):
-        v = current_viewer()
-        if not v:
-            return
-        names = {L.name for L in _images(v)}
-        cur = getattr(v.layers.selection.active, "name", None)
-        for i in range(lst.count()):
-            it = lst.item(i)
-            it.setSelected(it.text() == cur and it.text() in names)
-
-    def _select_all(*_):
-        for i in range(lst.count()):
-            lst.item(i).setSelected(True)
-
-    def _clear_sel(*_):
-        for i in range(lst.count()):
-            lst.item(i).setSelected(False)
-
-    btn_open_mirror.changed.connect(_open_mirror)
-    btn_close_mirror.changed.connect(_close_mirror)
-    btn_sel_active.changed.connect(_select_active)
-    btn_sel_all.changed.connect(_select_all)
-    btn_clear_sel.changed.connect(_clear_sel)
-
-    v = current_viewer()
-    if v:
-        _refresh_list(select_active_if_empty=True)
-        try:
-            v.layers.events.inserted.connect(lambda *_: _refresh_list(False))
-            v.layers.events.removed.connect(lambda *_: _refresh_list(False))
-            v.layers.events.reordered.connect(lambda *_: _refresh_list(False))
-            v.layers.selection.events.active.connect(
-                lambda *_: _refresh_list(True)
-            )
-        except Exception:
-            pass
-
-    # layout for mirror controls
-    mir_top = QWidget()
-    mt = QHBoxLayout(mir_top)
-    mt.setContentsMargins(0, 0, 0, 0)
-    mt.setSpacing(10)
-    mt.addWidget(btn_open_mirror.native)
-    mt.addWidget(btn_close_mirror.native)
-    mt.addWidget(link_z.native)
-    mt.addStretch(1)
-
-    mir_tools = QWidget()
-    mtools = QHBoxLayout(mir_tools)
-    mtools.setContentsMargins(0, 0, 0, 0)
-    mtools.setSpacing(8)
-    mtools.addWidget(btn_sel_active.native)
-    mtools.addWidget(btn_sel_all.native)
-    mtools.addWidget(btn_clear_sel.native)
-    mtools.addStretch(1)
-
-    mir_col = QWidget()
-    mcol = QVBoxLayout(mir_col)
-    mcol.setContentsMargins(0, 0, 0, 0)
-    mcol.setSpacing(10)
-    mcol.addWidget(mir_top)
-    mcol.addWidget(mir_tools)
-    mcol.addWidget(QLabel("Mirror these images in 3D:"))
-    mcol.addWidget(lst)
-
-    mirror_card = _card("3D mirror (separate window)", mir_col)
-
-    # ---------- assemble page ----------
-    page = QWidget()
-    pv = QVBoxLayout(page)
-    pv.setContentsMargins(18, 16, 18, 18)
-    pv.setSpacing(16)
-    pv.addWidget(viewer_card)
-    pv.addWidget(mirror_card)
-
-    # ---------- Segmentation Loader ----------
-    seg_btn = PushButton(text="Load segmentation for active image…")
-    seg_btn.native.setMinimumHeight(32)
-
-    def _load_segmentation(*_):
+    def _apply_threshold(*_):
         v = current_viewer()
         if not v:
             show_warning("Open napari viewer first.")
@@ -378,87 +190,219 @@ def _make_view3d_tab() -> QWidget:
 
         img = v.layers.selection.active
         if not isinstance(img, NapariImage):
-            show_warning("Select a 3-D image layer first.")
+            show_warning("Select an image layer first.")
             return
 
-        path, _ = QFileDialog.getOpenFileName(
-            None,
-            "Pick segmentation file (RAW/BIN, same shape as image)",
-            "",
-            "RAW/BIN (*.raw *.RAW *.bin *.BIN);;All files (*)",
-        )
-        if not path:
+        raw_data = np.asarray(img.data)
+
+        # Get threshold values
+        lo = float(thresh_low.value)
+        hi = float(thresh_high.value)
+
+        if lo >= hi:
+            show_warning("Low threshold must be less than high threshold.")
             return
 
-        shp = tuple(int(s) for s in np.asarray(img.data).shape)
+        # Create binary mask
+        mask = (raw_data >= lo) & (raw_data <= hi)
 
-        try:
-            raw = np.fromfile(path, dtype=np.uint8)
-        except Exception as e:
-            show_warning(f"Failed to load segmentation: {e}")
-            return
-
-        if raw.size != np.prod(shp):
-            show_warning(
-                f"Segmentation size mismatch.\n"
-                f"Image shape = {shp}, file voxels = {raw.size}"
-            )
-            return
-
-        seg = raw.reshape(shp)
-
-        # ---------- NEW: turn binary mask into instance labels ----------
+        # Connected components labeling
         if ndi is None:
-            # no SciPy → just show what we have as labels
-            labels = seg.astype(np.int32, copy=False)
+            labels = mask.astype(np.int32)
             n = int(labels.max())
             show_warning(
-                "SciPy is not installed – showing raw labels.\n"
-                "Run `pip install scipy` in this environment for per-object labelling."
+                "SciPy not installed – showing raw binary mask.\n"
+                "Install scipy for connected-component labeling."
             )
+            _log_message("WARNING: SciPy not installed - using binary mask only")
         else:
-            vals = np.unique(seg)
-            vals = vals[vals != 0]  # ignore background
-            if vals.size <= 1:
-                # looks binary (0 / 1) → connected components in 3D
-                labels, n = ndi.label(seg > 0)
-            else:
-                # already labelled (0,1,2,3,…) → just use as-is
-                labels = seg.astype(np.int32, copy=False)
-                n = int(labels.max())
+            labels, n = ndi.label(mask)
 
+        # Add labels layer to viewer
+        layer_name = f"{img.name} [threshold {lo}-{hi}, {n} objects]"
         v.add_labels(
             labels,
-            name=f"{img.name} [seg_cc {n}]",
+            name=layer_name,
             blending="translucent",
             opacity=0.7,
             rendering="iso_categorical",
         )
 
-        show_info(f"Segmentation loaded with {n} connected component(s).")
+        show_info(f"Segmentation: {n} connected component(s) found.")
+        _log_message(f"Applied threshold [{lo:.1f}-{hi:.1f}] on '{img.name}'")
+        _log_message(f"→ Found {n} connected components")
+        _log_message(f"→ Added labels layer '{layer_name}'")
 
-    seg_btn.changed.connect(_load_segmentation)
+    btn_threshold.changed.connect(_apply_threshold)
 
-    seg_box = QFrame()
-    seg_box.setObjectName("seg_card")
-    seg_lay = QVBoxLayout(seg_box)
-    seg_lay.setContentsMargins(16, 12, 16, 16)
-    seg_lay.setSpacing(12)
-    seg_title = QLabel("Segmentation")
-    seg_title.setStyleSheet("font-weight:600;")
-    seg_lay.addWidget(seg_title)
-    seg_lay.addWidget(seg_btn.native)
-    seg_box.setStyleSheet(
-        """
-        QFrame#seg_card {
-            border: 1px solid #4a4a4a;
-            border-radius: 10px;
-            background-color: rgba(255,255,255,0.03);
-        }
-    """
-    )
+    # Layout for threshold controls
+    thresh_row1 = QWidget()
+    tr1 = QHBoxLayout(thresh_row1)
+    tr1.setContentsMargins(0, 0, 0, 0)
+    tr1.setSpacing(16)
+    tr1.addWidget(QLabel("Low:"))
+    tr1.addWidget(thresh_low.native)
+    tr1.addWidget(QLabel("High:"))
+    tr1.addWidget(thresh_high.native)
+    tr1.addStretch(1)
 
-    pv.addWidget(seg_box)
+    # Button row
+    thresh_row2 = QWidget()
+    tr2 = QHBoxLayout(thresh_row2)
+    tr2.setContentsMargins(0, 0, 0, 0)
+    tr2.setSpacing(10)
+    tr2.addWidget(btn_threshold.native)
+    tr2.addStretch(1)
+
+    # Log section only (legend removed)
+    log_legend_widget = QWidget()
+    log_legend_layout = QVBoxLayout(log_legend_widget)
+    log_legend_layout.setContentsMargins(0, 0, 0, 0)
+    log_legend_layout.setSpacing(12)
+
+    log_label = QLabel("Activity Log")
+    log_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+    log_legend_layout.addWidget(log_label)
+    log_legend_layout.addWidget(log_text)
+
+    thresh_col = QWidget()
+    tcol = QVBoxLayout(thresh_col)
+    tcol.setContentsMargins(0, 0, 0, 0)
+    tcol.setSpacing(16)
+    tcol.addWidget(thresh_row1)
+    tcol.addWidget(thresh_row2)
+    tcol.addWidget(log_legend_widget)
+
+    threshold_card = _card("Threshold (Transfer Function)", thresh_col)
+
+    # ---------- Otsu Automatic Segmentation ----------
+    otsu_classes = FloatSpinBox(value=2, min=2, max=5, step=1)
+    blur_sigma = FloatSpinBox(value=1.0, min=0.0, max=5.0, step=0.5)
+
+    for w in (otsu_classes.native, blur_sigma.native):
+        try:
+            w.setMinimumWidth(120)
+            w.setMinimumHeight(30)
+        except Exception:
+            pass
+
+    btn_otsu = PushButton(text="Apply Otsu segmentation")
+    btn_otsu.native.setMinimumHeight(40)
+    btn_otsu.native.setStyleSheet("font-weight: bold;")
+
+    def _apply_otsu(*_):
+        v = current_viewer()
+        if not v:
+            show_warning("Open napari viewer first.")
+            return
+
+        img = v.layers.selection.active
+        if not isinstance(img, NapariImage):
+            show_warning("Select an image layer first.")
+            return
+
+        raw_data = np.asarray(img.data, dtype=np.float32)
+        sigma = float(blur_sigma.value)
+        num_classes = int(otsu_classes.value)
+
+        # Optional Gaussian blur to reduce noise
+        if sigma > 0:
+            try:
+                from scipy.ndimage import gaussian_filter
+
+                raw_data = gaussian_filter(raw_data, sigma=sigma)
+                _log_message(f"Applied Gaussian blur (σ={sigma:.1f})")
+            except Exception as e:
+                show_warning(f"Blur failed: {e}")
+                _log_message(f"WARNING: Blur failed - {e}")
+                return
+
+        # Apply Otsu thresholding
+        try:
+            if num_classes == 2:
+                thresh = threshold_otsu(raw_data)
+                mask = raw_data >= thresh
+                _log_message(f"Otsu threshold: {thresh:.1f}")
+            else:
+                thresholds = threshold_multiotsu(raw_data, classes=num_classes)
+                _log_message(
+                    f"Otsu thresholds ({num_classes} classes): "
+                    f"{[f'{t:.1f}' for t in thresholds]}"
+                )
+                # Create multi-level mask (union of high classes)
+                mask = np.zeros_like(raw_data, dtype=bool)
+                for t in thresholds:
+                    mask |= raw_data >= t
+        except Exception as e:
+            show_warning(f"Otsu failed: {e}")
+            _log_message(f"ERROR: Otsu segmentation failed - {e}")
+            return
+
+        # Connected components labeling
+        if ndi is None:
+            labels = mask.astype(np.int32)
+            n = int(labels.max())
+            show_warning("SciPy not installed – showing binary mask.")
+            _log_message("WARNING: SciPy not installed - binary mask only")
+        else:
+            labels, n = ndi.label(mask)
+
+        # Add labels layer
+        layer_name = f"{img.name} [otsu_{num_classes}class, {n} objects]"
+        v.add_labels(
+            labels,
+            name=layer_name,
+            blending="translucent",
+            opacity=0.7,
+            rendering="iso_categorical",
+        )
+
+        show_info(f"Otsu segmentation: {n} connected component(s) found.")
+        _log_message(f"Applied Otsu ({num_classes} classes) on '{img.name}'")
+        _log_message(f"→ Found {n} connected components")
+        _log_message(f"→ Added labels layer '{layer_name}'")
+
+    btn_otsu.changed.connect(_apply_otsu)
+
+    # Layout for Otsu controls
+    otsu_row1 = QWidget()
+    or1 = QHBoxLayout(otsu_row1)
+    or1.setContentsMargins(0, 0, 0, 0)
+    or1.setSpacing(16)
+    or1.addWidget(QLabel("Classes:"))
+    or1.addWidget(otsu_classes.native)
+    or1.addWidget(QLabel("Blur σ:"))
+    or1.addWidget(blur_sigma.native)
+    or1.addStretch(1)
+
+    otsu_row2 = QWidget()
+    or2 = QHBoxLayout(otsu_row2)
+    or2.setContentsMargins(0, 0, 0, 0)
+    or2.setSpacing(10)
+    or2.addWidget(btn_otsu.native)
+    or2.addStretch(1)
+
+    otsu_col = QWidget()
+    ocol = QVBoxLayout(otsu_col)
+    ocol.setContentsMargins(0, 0, 0, 0)
+    ocol.setSpacing(16)
+    ocol.addWidget(otsu_row1)
+    ocol.addWidget(otsu_row2)
+
+    otsu_card = _card("Otsu Segmentation (automatic)", otsu_col)
+
+    # ---------- assemble page ----------
+    page = QWidget()
+    pv = QVBoxLayout(page)
+    pv.setContentsMargins(24, 20, 24, 24)
+    pv.setSpacing(20)
+    pv.addWidget(viewer_card)
+    pv.addWidget(threshold_card)
+    pv.addWidget(otsu_card)
     pv.addStretch(1)
+
+    # Initial log message
+    _log_message("3D View tab initialized")
+    _log_message("Ready for threshold segmentation")
 
     return _pad(page)

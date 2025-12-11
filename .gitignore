@@ -28,3 +28,5 @@ __pycache__/
 *.py[cod]
 .venv/.venv_backup_typemap/
 
+
+napari_pypore3d/models/

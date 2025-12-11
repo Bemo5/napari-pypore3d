@@ -40,9 +40,13 @@ except Exception:
         @classmethod
         def load(cls): return cls()
     def cap_width(*_, **__): pass
+    
 from .functions import functions_widget
+from .brush import brush_widget
+
 def function_page_widget():
     return functions_widget()
+
 try:
     from .slice_compare import make_slice_compare_panel
 except Exception:
@@ -75,6 +79,7 @@ try:
 except Exception:
     def wire_caption_events_once(): pass
     def refresh_all_captions(*_): pass
+from .state import set_active_tab, active_tab, is_tab_active
 
 # ---------------- constants ---------------------------------------------------
 PLUGIN_BUILD = "napari-pypore3d r50 (clean & robust)"
@@ -797,7 +802,6 @@ def raw_loader_widget() -> QWidget:
     # ------------------------------------------------------------------
     # HEAVY TABS: Plot Lab / Info / Export / Functions → LAZY BUILT
     # ------------------------------------------------------------------
-    # Placeholders with simple layouts; filled on first activation.
     plot_tab = QWidget()
     plot_tab_layout = QVBoxLayout(plot_tab)
     plot_tab_layout.setContentsMargins(0, 0, 0, 0)
@@ -816,15 +820,24 @@ def raw_loader_widget() -> QWidget:
     fn_tab_layout.setSpacing(0)
     fn_tab_index = tabs.addTab(fn_tab, "Functions")
 
+    brush_tab = QWidget()
+    brush_tab_layout = QVBoxLayout(brush_tab)
+    brush_tab_layout.setContentsMargins(0, 0, 0, 0)
+    brush_tab_layout.setSpacing(0)
+    brush_tab_index = tabs.addTab(brush_tab, "Brush / SAM")
+
     # Lazy-built objects + flags
     plotlab = None
     info_widget = None
     info_refresh = lambda: None  # stub until real one is built
     fn_page = None
+    brush_page = None
 
     built_plot = False
     built_info = False
     built_fn = False
+    built_brush = False
+
 
     # --- outer wrapper (scroll etc.) ---
     outer = QWidget()
@@ -893,16 +906,20 @@ def raw_loader_widget() -> QWidget:
         except Exception as e:
             show_warning(f"Functions page failed to build: {e!r}")
 
-    # Ensure the correct heavy tab is built when user switches tabs
-    def _on_tab_changed(idx: int):
-        if idx == plot_tab_index:
-            _ensure_plotlab()
-        elif idx == info_tab_index:
-            _ensure_info()
-        elif idx == fn_tab_index:
-            _ensure_functions()
+    def _ensure_brush():
+        nonlocal brush_page, built_brush
+        if built_brush:
+            return
+        try:
+            brush_pg = brush_widget()  # magicgui Container
+            brush_qwidget = brush_pg.native if hasattr(brush_pg, "native") else brush_pg
+            brush_tab_layout.addWidget(_pad(brush_qwidget))
+            brush_page = brush_pg
+            built_brush = True
+        except Exception as e:
+            show_warning(f"Brush page failed to build: {e!r}")
 
-    tabs.currentChanged.connect(_on_tab_changed)
+
 
     # Initial width cap (before heavy tabs exist, it's basically a no-op)
     _apply_cap_width()
@@ -923,32 +940,63 @@ def raw_loader_widget() -> QWidget:
             if current == load_tab_index:
                 ui._refresh_loaded_list()
 
-            # Only build + recompute Info/Export when its tab is active
-            if current == info_tab_index:
-                if not built_info:
-                    _ensure_info()
+            # Only recompute Info/Export when its tab is active
+            if current == info_tab_index and built_info:
                 try:
                     info_refresh()
                 except Exception:
                     pass
 
-        # connect ONLY structural events to _on_layers
         v.layers.events.inserted.connect(_on_layers)
         v.layers.events.removed.connect(_on_layers)
         v.layers.events.reordered.connect(_on_layers)
-        # DO NOT connect layers.events.changed here – it fires all the time.
-
-        # still no dims.current_step hooks (these caused crash/lag before)
 
         # captions react only to active-layer change (very cheap)
         v.layers.selection.events.active.connect(
             lambda *_: refresh_all_captions("bottom")
         )
 
+        # ---------------- tab change wiring (lazy + state) -------------
+        # set initial active tab
+        set_active_tab("load")
+
+        def _on_tab_changed(idx: int):
+            # 1) Update global tab state (for plots/info modules using is_tab_active)
+            if idx == load_tab_index:
+                set_active_tab("load")
+            elif idx == plot_tab_index:
+                set_active_tab("plot")
+            elif idx == info_tab_index:
+                set_active_tab("info")
+            elif idx == fn_tab_index:
+                set_active_tab("functions")
+            elif idx == brush_tab_index:
+                set_active_tab("brush")
+            elif idx == crop_tab_index:
+                set_active_tab("crop")
+            elif idx == slice_tab_index:
+                set_active_tab("slice")
+            elif idx == view3d_tab_index:
+                set_active_tab("view3d")
+            else:
+                set_active_tab(f"tab_{idx}")
+
+            # 2) Ensure heavy tabs are built on first use
+            if idx == plot_tab_index:
+                _ensure_plotlab()
+            elif idx == info_tab_index:
+                _ensure_info()
+            elif idx == fn_tab_index:
+                _ensure_functions()
+            elif idx == brush_tab_index:
+                _ensure_brush()
+
+            # 3) Do a light refresh now that active tab changed
+            _on_layers()
+
+        tabs.currentChanged.connect(_on_tab_changed)
+
         # initial update (respect active-tab gating)
         _on_layers()
-
-    return wrapper
-
 
     return wrapper
