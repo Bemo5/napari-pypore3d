@@ -30,3 +30,18 @@ __pycache__/
 
 
 napari_pypore3d/models/
+
+# --- local envs / backups ---
+.venv/
+venv/
+.env/
+.venv_backup_typemap/
+
+# --- local data outputs ---
+napari_pypore3d/data/
+*.npy
+
+# --- misc local files ---
+TO-DO.txt
+all-files.txt
+install-log.txt
