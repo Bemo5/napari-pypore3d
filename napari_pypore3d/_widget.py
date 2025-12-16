@@ -785,7 +785,7 @@ def raw_loader_widget() -> QWidget:
     load_tab_index = tabs.addTab(load_tab, "Load")
 
     # --- Crop / Tools tab (eager, usually cheap) ---
-    _, crop_panel = make_crop_panel()
+    crop_ctrl, crop_panel = make_crop_panel()
     crop_tab = _pad(crop_panel)
     crop_tab_index = tabs.addTab(crop_tab, "Crop / Tools")
 
@@ -950,6 +950,8 @@ def raw_loader_widget() -> QWidget:
         v.layers.events.inserted.connect(_on_layers)
         v.layers.events.removed.connect(_on_layers)
         v.layers.events.reordered.connect(_on_layers)
+        v.layers.selection.events.active.connect(crop_ctrl.on_layers_changed)
+
 
         # captions react only to active-layer change (very cheap)
         v.layers.selection.events.active.connect(

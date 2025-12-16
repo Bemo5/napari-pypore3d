@@ -1,147 +1,131 @@
-from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
-from PIL import Image
+# sam_napari_edit_save_as_slice.py
+# ---------------------------------------------------------
+# Loads ONE fixed image path.
+# Asks for slice index ONLY to name the output file.
+# Exports ONE editable instance-label mask (.npy, uint16).
+# Opens napari with automatic coloured labels (editable).
+# ---------------------------------------------------------
+
+from pathlib import Path
 import numpy as np
-import matplotlib.pyplot as plt
-import torch  # 🔹 NEW
+import torch
+from PIL import Image
+import napari
+
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+
 
 # ----------------------------
-# Paths
+# Fixed input image path (ALWAYS this)
 # ----------------------------
 IMAGE_PATH = "napari_pypore3d/Images/image.png"
 CHECKPOINT_PATH = "napari_pypore3d/models/sam_vit_b_01ec64.pth"
+OUT_DIR = Path("napari_pypore3d/data")
 
 # ----------------------------
-# Load image
-# ----------------------------
-image = Image.open(IMAGE_PATH).convert("RGB")
-image_np = np.asarray(image)
-H, W = image_np.shape[:2]
-total_pixels = H * W
-print(f"Loaded image {IMAGE_PATH} with shape {image_np.shape}")
-
-# ----------------------------
-# Device (CPU / GPU)
-# ----------------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print("Using device:", device)
-
-# ----------------------------
-# Load SAM model (vit_b)
-# ----------------------------
-print("Loading SAM model (vit_b)...")
-sam = sam_model_registry["vit_b"](checkpoint=CHECKPOINT_PATH)
-sam.to(device)  # 🔹 Move model to GPU if available
-print("SAM loaded on", device, "\n")
-
-# ----------------------------
-# LOOSE mode = default / active
-# ----------------------------
-# You can drop points_per_side from 64 -> 32 if still too slow
-generator_kwargs = dict(
-    points_per_side=64,          # denser grid -> more proposals
-    pred_iou_thresh=0.70,
-    stability_score_thresh=0.85,
-    crop_n_layers=1,
+# FAST SAM defaults
+SAM_KWARGS = dict(
+    points_per_side=32,            # was 16 → more proposals (detect more)
+    pred_iou_thresh=0.60,          # was 0.75 → keep more candidates
+    stability_score_thresh=0.75,   # was 0.90 → keep less-stable masks too
+    crop_n_layers=1,               # was 0 → finds smaller objects (slower)
     crop_n_points_downscale_factor=2,
-    min_mask_region_area=30,
+    min_mask_region_area=30,       # was 80 → allow small regions
 )
 
-IOU_MIN = 0.80          # external IoU filter
-MIN_AREA = 40           # pixels
-MAX_AREA_FRAC = 0.6     # ignore single huge blobs > 60% of image
 
-print("Running SAM (LOOSE mode, active)...")
-print("Generator kwargs:", generator_kwargs)
-print(f"External IoU filter: >= {IOU_MIN}")
-print(f"External area filter: >= {MIN_AREA} px, <= {MAX_AREA_FRAC:.2f} * image\n")
+# Extra filtering (reduces mask spam)
+IOU_MIN = 0.70 # min predicted IoU for a mask
+MAX_AREA_FRAC = 0.90  # max area fraction of image for a mask
 
-mask_generator = SamAutomaticMaskGenerator(model=sam, **generator_kwargs)
 
-print("Generating masks...")
-masks = mask_generator.generate(image_np)
-print(f"Raw masks from SAM: {len(masks)}")
+def ask_slice_index_for_naming() -> int:
+    s = input("Enter slice index Z for OUTPUT naming (e.g. 22): ").strip()
+    if not s:
+        raise SystemExit("No slice index entered.")
+    try:
+        z = int(s)
+    except ValueError:
+        raise SystemExit(f"Invalid slice index: {s}")
+    if z < 0:
+        raise SystemExit("Slice index must be >= 0.")
+    return z
 
-if not masks:
-    raise SystemExit("No masks generated. Check parameters or image.")
 
-# ----------------------------
-# Filter by IoU + area
-# ----------------------------
-max_area = MAX_AREA_FRAC * total_pixels
-filtered = []
-for m in masks:
-    iou = m["predicted_iou"]
-    area = m["area"]
-    if iou < IOU_MIN:
-        continue
-    if area < MIN_AREA:
-        continue
-    if area > max_area:
-        continue
-    filtered.append(m)
+def main():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-masks = sorted(filtered, key=lambda x: x["area"], reverse=True)
-print(f"Masks after filtering: {len(masks)}")
+    # 1) Load image normally (fixed path)
+    img_path = Path(IMAGE_PATH)
+    if not img_path.exists():
+        raise SystemExit(f"Image not found: {img_path}")
 
-if not masks:
-    raise SystemExit("No masks survived filtering. Try lowering IOU_MIN or MIN_AREA.")
+    image = Image.open(img_path).convert("RGB")
+    image_np = np.asarray(image)
+    H, W = image_np.shape[:2]
+    total_pixels = H * W
+    print("Loaded image:", img_path, image_np.shape)
 
-# ----------------------------
-# Visualise all masks
-# ----------------------------
-plt.figure(figsize=(8, 8))
-plt.imshow(image_np)
+    # 2) Ask slice index ONLY for naming output
+    z = ask_slice_index_for_naming()
+    ztag = f"z{z:03d}"
 
-overlay = np.zeros((H, W, 4), dtype=float)
-np.random.seed(42)
+    # 3) SAM on GPU if available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Device:", device)
 
-for m in masks:
-    mask = m["segmentation"]
-    color = np.random.random(3)
-    overlay[mask] = [*color, 0.6]
+    sam = sam_model_registry["vit_b"](checkpoint=CHECKPOINT_PATH)
+    sam.to(device)
 
-plt.imshow(overlay)
-plt.title(f"SAM loose mode — All detected objects (n = {len(masks)})")
-plt.axis("off")
-plt.tight_layout()
-plt.show()
+    gen = SamAutomaticMaskGenerator(model=sam, **SAM_KWARGS)
 
-# ----------------------------
-# Build labeled mask
-# ----------------------------
-labeled_mask = np.zeros((H, W), dtype=np.int32)
-for idx, m in enumerate(masks):
-    mask = m["segmentation"]
-    labeled_mask[mask] = idx + 1  # labels start at 1
+    print("Generating masks...")
+    masks = gen.generate(image_np)
+    print("Raw masks:", len(masks))
+    if not masks:
+        raise SystemExit("No masks generated.")
 
-np.save("segmentation_labels.npy", labeled_mask)
+    # 4) Filter masks to reduce clutter
+    max_area = MAX_AREA_FRAC * total_pixels
+    kept = []
+    for m in masks:
+        if m.get("predicted_iou", 0.0) < IOU_MIN:
+            continue
+        if m.get("area", 0) > max_area:
+            continue
+        kept.append(m)
 
-print("\nSaved labeled mask to: segmentation_labels.npy")
-print(f"Mask shape: {labeled_mask.shape}")
-print(f"Unique labels (incl. background): {np.unique(labeled_mask).size}")
+    kept = sorted(kept, key=lambda m: int(m.get("area", 0)), reverse=True)
+    print("Kept masks:", len(kept))
 
-# ----------------------------
-# Stats
-# ----------------------------
-areas = np.array([m["area"] for m in masks], dtype=float)
-ious = np.array([m["predicted_iou"] for m in masks], dtype=float)
-print("\n=== Segmentation Statistics (LOOSE, active) ===")
-print(f"Total objects kept: {len(masks)}")
-print(f"Area min / mean / max: {areas.min():.1f} / {areas.mean():.1f} / {areas.max():.1f}")
-print(f"IoU  min / mean / max: {ious.min():.3f} / {ious.mean():.3f} / {ious.max():.3f}")
+    # 5) Build ONE editable instance label mask (uint16)
+    labels = np.zeros((H, W), dtype=np.uint16)
+    next_id = 1
 
-# ----------------------------
-# Napari snippet (single active labels)
-# ----------------------------
-print("\n=== To use in napari ===")
-print("import napari")
-print("import numpy as np")
-print("from PIL import Image")
-print("")
-print(f"image = np.array(Image.open('{IMAGE_PATH}'))")
-print("labels = np.load('segmentation_labels.npy')")
-print("")
-print("viewer = napari.Viewer()")
-print("viewer.add_image(image, name='Original Image')")
-print("viewer.add_labels(labels, name='SAM loose (active)')")
-print("napari.run()")
+    for m in kept:
+        seg = m["segmentation"]
+        write = seg & (labels == 0)   # stable, no-overwrite
+        if not np.any(write):
+            continue
+        if next_id >= 65535:
+            print("⚠️ hit uint16 label limit")
+            break
+        labels[write] = np.uint16(next_id)
+        next_id += 1
+
+    print("Instances written:", int(labels.max()))
+
+    # 6) Save with slice tag ONLY in filename
+    out_npy = OUT_DIR / f"sam_labels_{ztag}.npy"
+    np.save(out_npy, labels)
+    print("Saved:", out_npy)
+
+    # 7) Open in napari (napari auto-colours labels; you edit the IDs)
+    v = napari.Viewer()
+    v.add_image(image_np, name="Image")
+    v.add_labels(labels, name=f"SAM labels {ztag} (EDIT)", opacity=0.6)
+    napari.run()
+
+
+if __name__ == "__main__":
+    main()
