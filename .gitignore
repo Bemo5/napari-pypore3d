@@ -45,3 +45,9 @@ napari_pypore3d/data/
 TO-DO.txt
 all-files.txt
 install-log.txt
+
+napari_pypore3d/out/
+
+napari_pypore3d/train/
+
+napari_pypore3d/test/
