@@ -6,13 +6,16 @@
 #   - Step (dataclass)
 #   - register_handler(op, fn)
 #   - RECORDER (global Recorder instance)
+#   - get_recorder()
+#   - reset_global_recorder()
 #
-# Handlers signature:
-#   handler(viewer, step: Step) -> None
+# Live UI:
+#   - Recorder supports listeners so external panels (like recorder_panel.py)
+#     can refresh when steps change.
 # ---------------------------------------------------------------------
 
 from __future__ import annotations
-
+import numpy as np
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
@@ -21,12 +24,6 @@ import json
 
 from napari import current_viewer
 from napari.utils.notifications import show_info, show_warning, show_error
-
-from qtpy.QtCore import Qt
-from qtpy.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
-    QFileDialog, QMessageBox, QFrame
-)
 
 Handler = Callable[[Any, "Step"], None]
 _HANDLERS: Dict[str, Handler] = {}
@@ -38,7 +35,7 @@ class Step:
     target: str
     params: Dict[str, Any]
     notes: str = ""
-    ts: str = ""  # ISO-ish timestamp string
+    ts: str = ""  # timestamp string
 
 
 def register_handler(op: str, fn: Handler) -> None:
@@ -53,15 +50,50 @@ def _now_iso() -> str:
 class Recorder:
     def __init__(self) -> None:
         self.steps: List[Step] = []
-
-        # UI refs (optional)
-        self._log: Optional[QPlainTextEdit] = None
         self._viewer_getter = current_viewer
+
+        # External UI listeners (no args) – used by recorder_panel.py
+        self._listeners: List[Callable[[], None]] = []
+
+    # -------------------------
+    # Listeners (for live UI)
+    # -------------------------
+    def subscribe(self, fn: Callable[[], None]) -> Callable[[], None]:
+        """Subscribe a callback; returns an unsubscribe function."""
+        if fn not in self._listeners:
+            self._listeners.append(fn)
+
+        def _unsub():
+            try:
+                self._listeners.remove(fn)
+            except ValueError:
+                pass
+
+        return _unsub
+
+    def _notify(self) -> None:
+        dead: List[Callable[[], None]] = []
+        for fn in list(self._listeners):
+            try:
+                fn()
+            except Exception:
+                dead.append(fn)
+        for fn in dead:
+            try:
+                self._listeners.remove(fn)
+            except Exception:
+                pass
 
     # -------------------------
     # Core API
     # -------------------------
-    def add_step(self, op: str, target: str, params: Optional[Dict[str, Any]] = None, notes: str = "") -> None:
+    def add_step(
+        self,
+        op: str,
+        target: str,
+        params: Optional[Dict[str, Any]] = None,
+        notes: str = "",
+    ) -> None:
         st = Step(
             op=str(op),
             target=str(target),
@@ -70,11 +102,11 @@ class Recorder:
             ts=_now_iso(),
         )
         self.steps.append(st)
-        self._ui_refresh()
+        self._notify()
 
     def clear(self) -> None:
         self.steps.clear()
-        self._ui_refresh()
+        self._notify()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -102,7 +134,7 @@ class Recorder:
                 )
             )
         self.steps = out
-        self._ui_refresh()
+        self._notify()
 
     def load_json(self, text: str) -> None:
         d = json.loads(text)
@@ -125,8 +157,7 @@ class Recorder:
             show_warning("Recipe is empty.")
             return
 
-        # run steps in order
-        for i, step in enumerate(self.steps, start=1):
+        for step in self.steps:
             fn = _HANDLERS.get(step.op)
             if fn is None:
                 raise RuntimeError(f"No handler registered for op '{step.op}'")
@@ -134,129 +165,144 @@ class Recorder:
 
         show_info(f"Replayed {len(self.steps)} step(s).")
 
-    # -------------------------
-    # UI
-    # -------------------------
-    def make_session_widget(self) -> QWidget:
-        root = QWidget()
-        outer = QVBoxLayout(root)
-        outer.setContentsMargins(10, 10, 10, 10)
-        outer.setSpacing(8)
 
-        title = QLabel("Session Recipe")
-        title.setStyleSheet("font-size: 12pt; font-weight: 600;")
-        outer.addWidget(title)
-
-        sub = QLabel("This is a replayable log of what you ran. Save / load / replay.")
-        sub.setWordWrap(True)
-        sub.setStyleSheet("opacity: 0.85;")
-        outer.addWidget(sub)
-
-        row = QHBoxLayout()
-        row.setSpacing(8)
-
-        btn_replay = QPushButton("Replay")
-        btn_save = QPushButton("Save JSON…")
-        btn_load = QPushButton("Load JSON…")
-        btn_copy = QPushButton("Copy JSON")
-        btn_clear = QPushButton("Clear")
-
-        for b in (btn_replay, btn_save, btn_load, btn_copy, btn_clear):
-            b.setMinimumHeight(30)
-
-        row.addWidget(btn_replay)
-        row.addWidget(btn_save)
-        row.addWidget(btn_load)
-        row.addWidget(btn_copy)
-        row.addWidget(btn_clear)
-        row.addStretch(1)
-        outer.addLayout(row)
-
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        outer.addWidget(line)
-
-        log = QPlainTextEdit()
-        log.setReadOnly(True)
-        log.setMinimumHeight(220)
-        log.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
-        outer.addWidget(log)
-
-        self._log = log
-        self._ui_refresh()
-
-        def _confirm(msg: str) -> bool:
-            r = QMessageBox.question(root, "Confirm", msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            return r == QMessageBox.Yes
-
-        def on_replay():
-            try:
-                self.replay()
-            except Exception as e:
-                show_error(f"Replay failed: {e!r}")
-
-        def on_save():
-            path, _ = QFileDialog.getSaveFileName(root, "Save recipe JSON", "recipe.json", "JSON (*.json)")
-            if not path:
-                return
-            try:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(self.to_json())
-                show_info(f"Saved recipe: {path}")
-            except Exception as e:
-                show_error(f"Save failed: {e!r}")
-
-        def on_load():
-            path, _ = QFileDialog.getOpenFileName(root, "Load recipe JSON", "", "JSON (*.json)")
-            if not path:
-                return
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    txt = f.read()
-                self.load_json(txt)
-                show_info(f"Loaded recipe: {path}")
-            except Exception as e:
-                show_error(f"Load failed: {e!r}")
-
-        def on_copy():
-            try:
-                from qtpy.QtWidgets import QApplication
-                QApplication.clipboard().setText(self.to_json())
-                show_info("Copied recipe JSON to clipboard.")
-            except Exception as e:
-                show_error(f"Copy failed: {e!r}")
-
-        def on_clear():
-            if not self.steps:
-                return
-            if _confirm("Clear the current recipe?"):
-                self.clear()
-
-        btn_replay.clicked.connect(on_replay)
-        btn_save.clicked.connect(on_save)
-        btn_load.clicked.connect(on_load)
-        btn_copy.clicked.connect(on_copy)
-        btn_clear.clicked.connect(on_clear)
-
-        return root
-
-    def _ui_refresh(self) -> None:
-        if self._log is None:
-            return
-        if not self.steps:
-            self._log.setPlainText("(empty)\nRun a function and it will appear here.")
-            return
-
-        lines: List[str] = []
-        for i, s in enumerate(self.steps, start=1):
-            p = s.params or {}
-            summary = f"{i:02d}. {s.ts} | {s.op} | target='{s.target}' | {p}"
-            if s.notes:
-                summary += f" | notes={s.notes!r}"
-            lines.append(summary)
-        self._log.setPlainText("\n".join(lines))
-
-
-# Global singleton
+# -------------------------
+# Global singleton API
+# -------------------------
 RECORDER = Recorder()
+# ----------------------------
+# Global singleton helpers
+# ----------------------------
+
+def get_recorder() -> Recorder:
+    """Return the global recorder singleton used by the plugin."""
+    return RECORDER
+
+
+def reset_global_recorder() -> Recorder:
+    """Clear the global recorder (used when the dock widget is re-created)."""
+    try:
+        RECORDER.clear()
+    except Exception:
+        pass
+    return RECORDER
+
+
+# ----------------------------
+# Built-in replay handlers
+# ----------------------------
+
+def _find_layer_by_name(viewer, name: str):
+    if not viewer:
+        return None
+    for L in viewer.layers:
+        if getattr(L, "name", None) == name:
+            return L
+    return None
+
+
+def _clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(int(v), int(hi)))
+
+
+def _parse_crop_params(params: dict, shape_zyx):
+    """
+    Supports multiple param styles:
+      - z0,z1,y0,y1,x0,x1
+      - start_zyx + size_zyx
+      - crop_start_zyx + crop_size_zyx
+      - z_range/y_range/x_range
+    Returns slices (z0,z1,y0,y1,x0,x1) clamped to bounds.
+    """
+    Z, Y, X = map(int, shape_zyx)
+
+    # style A: start + size
+    for a, b in (("start_zyx", "size_zyx"), ("crop_start_zyx", "crop_size_zyx")):
+        if a in params and b in params:
+            sz = list(map(int, params[a]))
+            ss = list(map(int, params[b]))
+            z0, y0, x0 = sz
+            dz, dy, dx = ss
+            z1, y1, x1 = z0 + dz, y0 + dy, x0 + dx
+            break
+    else:
+        # style B: ranges
+        zr = params.get("z_range", None)
+        yr = params.get("y_range", None)
+        xr = params.get("x_range", None)
+        if zr and yr and xr:
+            z0, z1 = map(int, zr)
+            y0, y1 = map(int, yr)
+            x0, x1 = map(int, xr)
+        else:
+            # style C: explicit bounds (default full)
+            z0 = int(params.get("z0", 0))
+            z1 = int(params.get("z1", Z))
+            y0 = int(params.get("y0", 0))
+            y1 = int(params.get("y1", Y))
+            x0 = int(params.get("x0", 0))
+            x1 = int(params.get("x1", X))
+
+    # normalise + clamp
+    if z1 < z0: z0, z1 = z1, z0
+    if y1 < y0: y0, y1 = y1, y0
+    if x1 < x0: x0, x1 = x1, x0
+
+    z0 = _clamp(z0, 0, Z)
+    z1 = _clamp(z1, 0, Z)
+    y0 = _clamp(y0, 0, Y)
+    y1 = _clamp(y1, 0, Y)
+    x0 = _clamp(x0, 0, X)
+    x1 = _clamp(x1, 0, X)
+
+    # avoid empty slices
+    if z1 <= z0: z1 = min(z0 + 1, Z)
+    if y1 <= y0: y1 = min(y0 + 1, Y)
+    if x1 <= x0: x1 = min(x0 + 1, X)
+
+    return z0, z1, y0, y1, x0, x1
+
+
+def _op_crop_zyx(viewer, step: Step):
+    """
+    Replay handler for op='crop_zyx'.
+    Expects step.target = image layer name.
+    """
+    layer = _find_layer_by_name(viewer, str(step.target))
+    if layer is None:
+        raise RuntimeError(f"crop_zyx: target layer not found: {step.target!r}")
+
+    data = np.asarray(layer.data)
+    if data.ndim == 2:
+        # treat as (1,Y,X)
+        data = data[None, :, :]
+
+    if data.ndim != 3:
+        raise RuntimeError(f"crop_zyx: expected 3D (Z,Y,X), got shape {data.shape}")
+
+    z0, z1, y0, y1, x0, x1 = _parse_crop_params(step.params or {}, data.shape)
+
+    cropped = np.ascontiguousarray(data[z0:z1, y0:y1, x0:x1])
+    layer.data = cropped
+
+    # best-effort contrast refresh
+    try:
+        if hasattr(layer, "reset_contrast_limits"):
+            layer.reset_contrast_limits()
+    except Exception:
+        pass
+
+    show_info(f"Replayed crop_zyx on '{layer.name}': Z[{z0}:{z1}] Y[{y0}:{y1}] X[{x0}:{x1}] -> {cropped.shape}")
+
+
+# Register built-in op(s)
+register_handler("crop_zyx", _op_crop_zyx)
+
+
+def get_recorder() -> Recorder:
+    return RECORDER
+
+
+def reset_global_recorder() -> None:
+    # IMPORTANT: do NOT replace RECORDER object (other modules keep a reference).
+    RECORDER.clear()

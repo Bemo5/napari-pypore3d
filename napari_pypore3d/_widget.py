@@ -669,7 +669,7 @@ def raw_loader_widget() -> QWidget:
     brush_tab_layout = QVBoxLayout(brush_tab)
     brush_tab_layout.setContentsMargins(0, 0, 0, 0)
     brush_tab_layout.setSpacing(0)
-    brush_tab_index = tabs.addTab(brush_tab, "Brushi")
+    brush_tab_index = tabs.addTab(brush_tab, "Brush")
 
     monai_tab = QWidget()
     monai_tab_layout = QVBoxLayout(monai_tab)
@@ -677,13 +677,7 @@ def raw_loader_widget() -> QWidget:
     monai_tab_layout.setSpacing(0)
     monai_tab_index = tabs.addTab(monai_tab, "MONAI Segment")
 
-        # --- Session tab (always built, very light) ---
-    try:
-        session_panel = make_session_recorder_panel() if make_session_recorder_panel else QWidget()
-    except Exception:
-        session_panel = QWidget()
-    session_tab = _pad(session_panel)
-    session_tab_index = tabs.addTab(session_tab, "Session")
+
 
     plotlab = None
     info_widget = None
