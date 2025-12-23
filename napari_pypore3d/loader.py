@@ -1,6 +1,6 @@
 # napari_pypore3d/loader.py
 # ---------------------------------------------------------------------
-# RAW/BIN loader + bulk add helpers.
+# RAW loader + bulk add helpers.
 # Uses helpers.py for shared utilities (shape hints, cropping, names, etc.).
 
 from __future__ import annotations
@@ -160,13 +160,13 @@ def raw_loader_widget(
     dtype: str = "auto",
 ):
     """
-    RAW/BIN loader (little-endian). Supports filename hints (AxBxC, N^3).
+    RAW loader (little-endian). Supports filename hints (AxBxC, N^3).
     Aligns the displayed view to the smallest existing volume (center-crop),
     but preserves the FULL array in layer.metadata['_orig_full'] for tools/crop.
     """
     p = pathlib.Path(path).expanduser().resolve() if path else None
     if not p or not p.exists() or p.is_dir():
-        raise FileNotFoundError("Select a valid RAW/BIN file.")
+        raise FileNotFoundError("Select a valid RAW file.")
 
     chosen_shape, inferred_dtype = _infer_shape_and_dtype(
         p, shape_y=shape_y, shape_x=shape_x
@@ -255,7 +255,7 @@ def add_many_files(settings: AppSettings) -> None:
         None,
         "Add RAW files",
         start_dir,
-        "RAW/BIN (*.raw *.RAW *.bin *.BIN);;All (*)",
+        "RAW (*.raw *.RAW *.bin *.BIN);;All (*)",
     )
     if not paths:
         return
@@ -283,7 +283,7 @@ def add_from_folder(settings: AppSettings) -> None:
         if pathlib.Path(f).suffix in exts
     ]
     if not files:
-        show_warning("No RAW/BIN files in folder.")
+        show_warning("No RAW files in folder.")
         return
     settings.last_dir = folder
     for p in files:

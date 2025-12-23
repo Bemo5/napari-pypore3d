@@ -1,11 +1,4 @@
-﻿# napari_pypore3d/_widget.py — r50 CLEAN & ROBUST (mixed sizes, no dup-skip, stable grid)
-# ----------------------------------------------------------------------------------------
-# - Auto-infer RAW/BIN (Ax×BxC / N^3 → else Y/X→Z → else perfect cube; little-endian)
-# - View-only center crop to current smallest Z×Y×X + **safe contrast** + **Z clamp**
-# - One Points layer per image; **force [image, dot] order**; grid.stride=2 only when safe
-# - Stable grid (images count only); dot is pinned to current Z; fast toggle
-# - “Loaded layers” list with Delete selected / Delete ALL
-
+﻿# napari_pypore3d/_widget.py — r51 (adds Session Recorder tab, global recorder reset)
 from __future__ import annotations
 import os, re, math, pathlib
 from typing import Optional, Tuple, List
@@ -40,9 +33,23 @@ except Exception:
         @classmethod
         def load(cls): return cls()
     def cap_width(*_, **__): pass
-    
+
 from .functions import functions_widget
 from .brush import brush_widget
+
+# --- Session Recorder (global singleton) ---
+try:
+    from .session_recorder import reset_global_recorder
+    from .recorder_panel import make_session_recorder_panel
+except Exception:
+    reset_global_recorder = None
+    make_session_recorder_panel = None
+
+# --- MONAI inference tab (lazy) ---
+try:
+    from .monai_infer_widget import make_monai_infer_widget
+except Exception:
+    make_monai_infer_widget = None
 
 def function_page_widget():
     return functions_widget()
@@ -79,10 +86,11 @@ try:
 except Exception:
     def wire_caption_events_once(): pass
     def refresh_all_captions(*_): pass
+
 from .state import set_active_tab, active_tab, is_tab_active
 
 # ---------------- constants ---------------------------------------------------
-PLUGIN_BUILD = "napari-pypore3d r50 (clean & robust)"
+PLUGIN_BUILD = "napari-pypore3d plugin enjoy :)"
 _DTYPE_CHOICES = ["auto","uint8","uint16","int16","int32","float32","float64","int8"]
 _MIN_DOCK_WIDTH = 560
 CENTER_TAG = "[center] "
@@ -114,7 +122,6 @@ def _images(v) -> List[NapariImage]:
     for L in v.layers:
         if not isinstance(L, NapariImage):
             continue
-        # Skip slice-compare children and any 2-D images
         md = getattr(L, "metadata", {}) or {}
         if md.get("_slice_compare", False):
             continue
@@ -122,8 +129,6 @@ def _images(v) -> List[NapariImage]:
             continue
         out.append(L)
     return out
-
-
 
 def _centers(v) -> List[NapariPoints]:
     return [L for L in (v.layers if v else []) if isinstance(L, NapariPoints) and L.name.startswith(CENTER_TAG)]
@@ -190,22 +195,18 @@ def _infer_shape_dtype(path: str, dtype_name: str, Z:int,Y:int,X:int) -> Optiona
     for dt in cands:
         item = np.dtype(dt).itemsize
         if fsize % item: continue
-        # a) filename hint → Z from bytes
         if planes:
             Zc = (fsize//item)//planes
             if Zc>0 and _dtype_ok_quick(p,dt,fsize): out.append((np.dtype(dt),(int(Zc),int(hint[1]),int(hint[2])))); continue
-        # b) given Y/X → Z
         if Y>0 and X>0:
             pl = Y*X
             if pl>0 and (fsize//item)>=pl and ((fsize//item)%pl)==0:
                 Zc = (fsize//item)//pl
                 if Zc>0 and _dtype_ok_quick(p,dt,fsize): out.append((np.dtype(dt),(int(Zc),int(Y),int(X)))); continue
-        # c) perfect cube
         vox = fsize//item; n = int(round(vox**(1/3))) if vox>0 else 0
         if n>0 and n*n*n==vox and _dtype_ok_quick(p,dt,fsize): out.append((np.dtype(dt),(n,n,n)))
 
     if not out: return None
-    # prefer earlier dtype in cands order
     order = {np.dtype(t):i for i,t in enumerate([np.uint8,np.uint16,np.int16,np.uint32,np.int32,np.float32,np.float64,np.int8])}
     out.sort(key=lambda t: order.get(np.dtype(t[0]),999))
     dt, shp = out[0]
@@ -261,101 +262,8 @@ def _apply_center_crop(layer: NapariImage, target_zyx: Tuple[int,int,int]):
     _safe_contrast(layer)
 
 def _smallest_shape(imgs: List[NapariImage]) -> Optional[Tuple[int, int, int]]:
-    """Return common target (TZ, TY, TX) using only real 3D volumes.
-
-    - Ignores 2D slice-compare views (metadata['_slice_compare'] == True)
-    - Treats 2D images as 1×Y×X if we ever see them here.
-    """
     if not imgs:
         return None
-
-    shapes: List[Tuple[int, int, int]] = []
-    for L in imgs:
-        md = getattr(L, "metadata", {}) or {}
-        if md.get("_slice_compare"):
-            # skip comparison views; they should not drive global cropping
-            continue
-
-        sh = np.asarray(L.data.shape, dtype=int)
-        if sh.size >= 3:
-            z, y, x = int(sh[-3]), int(sh[-2]), int(sh[-1])
-        elif sh.size == 2:
-            z, y, x = 1, int(sh[-2]), int(sh[-1])
-        else:
-            continue
-        shapes.append((z, y, x))
-
-    if not shapes:
-        return None
-
-    return (
-        min(s[0] for s in shapes),
-        min(s[1] for s in shapes),
-        min(s[2] for s in shapes),
-    )
-    if not imgs:
-        return None
-
-    shapes: List[Tuple[int, int, int]] = []
-    for L in imgs:
-        md = getattr(L, "metadata", {}) or {}
-        # skip 2D slice-compare views; only use real volumes
-        if md.get("_slice_compare"):
-            continue
-
-        sh = np.asarray(L.data.shape, dtype=int)
-        if sh.size >= 3:
-            z, y, x = int(sh[-3]), int(sh[-2]), int(sh[-1])
-        elif sh.size == 2:
-            # treat 2D as 1×Y×X (just in case)
-            z, y, x = 1, int(sh[-2]), int(sh[-1])
-        else:
-            continue
-        shapes.append((z, y, x))
-
-    if not shapes:
-        return None
-
-    return (
-        min(s[0] for s in shapes),
-        min(s[1] for s in shapes),
-        min(s[2] for s in shapes),
-    )
-    """
-    Return the smallest (Z, Y, X) among **3D stack** image layers only.
-
-    - Ignores 2D images (e.g. slice-compare views).
-    - Ignores images explicitly marked as slice-compare children via
-      metadata["_slice_compare"].
-    """
-    shapes: List[Tuple[int, int, int]] = []
-    for L in imgs:
-        shp = tuple(int(s) for s in np.asarray(L.data.shape))
-        # only treat genuine 3D stacks as candidates
-        if len(shp) != 3:
-            continue
-        if L.metadata.get("_slice_compare"):
-            continue
-        shapes.append(shp)
-
-    if not shapes:
-        return None
-
-    return (
-        min(s[0] for s in shapes),
-        min(s[1] for s in shapes),
-        min(s[2] for s in shapes),
-    )
-    """
-    Compute smallest (Z, Y, X) across 3D-like images.
-
-    Uses the LAST 3 dims as (Z, Y, X) so it works for:
-      (Z, Y, X), (C, Z, Y, X), (T, Z, Y, X), etc.
-    Ignores images with fewer than 3 dims.
-    """
-    if not imgs:
-        return None
-
     shapes3d: List[Tuple[int,int,int]] = []
     for L in imgs:
         shp = tuple(int(s) for s in np.asarray(L.data).shape)
@@ -363,15 +271,12 @@ def _smallest_shape(imgs: List[NapariImage]) -> Optional[Tuple[int, int, int]]:
             continue
         z, y, x = shp[-3:]
         shapes3d.append((z, y, x))
-
     if not shapes3d:
         return None
-
     TZ = min(z for (z, _, _) in shapes3d)
     TY = min(y for (_, y, _) in shapes3d)
     TX = min(x for (_, _, x) in shapes3d)
     return (TZ, TY, TX)
-
 
 # ---------------- centers (points) -------------------------------------------
 def _ensure_center(v, im: NapariImage) -> NapariPoints:
@@ -382,7 +287,6 @@ def _ensure_center(v, im: NapariImage) -> NapariPoints:
     ry = int(np.clip(int(oy)-int(ys), 0, max(int(im.data.shape[1])-1,0)))
     rx = int(np.clip(int(ox)-int(xs), 0, max(int(im.data.shape[2])-1,0)))
 
-    # pin Z to current 2D slice
     try: curZ = int(v.dims.current_step[0])
     except Exception: curZ = rz
 
@@ -415,7 +319,6 @@ def _remove_all_centers(v):
             try: v.layers.remove(L)
             except Exception: pass
 
-# strictly enforce [image, dot] order for every image we have a dot for
 def _force_pair_order(v):
     imgs = _images(v)
     for im in imgs:
@@ -440,15 +343,13 @@ def _apply_grid(v):
     if not v or v.dims.ndisplay != 2:
         return
 
-    # Count ALL images (volumes + 2D views) for grid tiling
     all_imgs = [L for L in (v.layers or []) if isinstance(L, NapariImage)]
     n = len(all_imgs)
 
     v.grid.enabled = (n >= 2)
     v.grid.shape   = _grid_shape(n)
 
-    # stride=2 only when every true 3D image has its paired center
-    imgs = _images(v)          # only 3-D volumes
+    imgs = _images(v)
     cents = _centers(v)
     all_paired = (
         len(cents) == len(imgs)
@@ -470,8 +371,6 @@ def _apply_grid(v):
             pass
         _LAST_GRID = new_state
 
-
-
 # ---------------- bulk guard --------------------------------------------------
 _IN_SYNC = False
 @contextmanager
@@ -482,10 +381,6 @@ def _bulk(v):
 
 # ---------------- core sync ---------------------------------------------------
 def _auto_match_and_fix(v):
-    """Crop all *volume* images to the smallest volume and fix contrast.
-
-    2D slice-compare views (metadata['_slice_compare']) are completely ignored here.
-    """
     imgs = _images(v)
     tgt = _smallest_shape(imgs)
     if not tgt:
@@ -495,7 +390,6 @@ def _auto_match_and_fix(v):
     for L in imgs:
         md = getattr(L, "metadata", {}) or {}
         if md.get("_slice_compare"):
-            # don't crop 2D comparison images
             continue
 
         cur = tuple(int(s) for s in np.asarray(L.data.shape))
@@ -504,48 +398,14 @@ def _auto_match_and_fix(v):
         else:
             _safe_contrast(L)
 
-    # clamp viewer Z so we never look outside cropped stacks
     try:
         z = int(v.dims.current_step[0])
         if z >= TZ:
             v.dims.set_current_step(0, TZ - 1)
     except Exception:
         pass
-    imgs = _images(v)
-    tgt = _smallest_shape(imgs)
-    if not tgt:
-        return
-    TZ, TY, TX = map(int, tgt)
-
-    for L in imgs:
-        md = getattr(L, "metadata", {}) or {}
-        # do NOT touch 2D slice-compare views
-        if md.get("_slice_compare"):
-            continue
-
-        cur = tuple(int(s) for s in np.asarray(L.data.shape))
-        if cur != (TZ, TY, TX):
-            _apply_center_crop(L, (TZ, TY, TX))
-        else:
-            _safe_contrast(L)
-    imgs = _images(v)
-    tgt = _smallest_shape(imgs)
-    if not tgt: return
-    TZ,TY,TX = map(int, tgt)
-
-    for L in imgs:
-        cur = tuple(int(s) for s in np.asarray(L.data.shape))
-        if cur != (TZ,TY,TX): _apply_center_crop(L, (TZ,TY,TX))
-        else: _safe_contrast(L)
-
-    # clamp viewer Z so we never look outside cropped stacks
-    try:
-        z = int(v.dims.current_step[0])
-        if z >= TZ: v.dims.set_current_step(0, TZ-1)
-    except Exception: pass
 
 def _rebuild_centers(v):
-    """Ensure we have one center point per real volume image."""
     imgs = [
         im
         for im in _images(v)
@@ -558,7 +418,6 @@ def _rebuild_centers(v):
     for im in imgs:
         _ensure_center(v, im)
 
-    # delete stale points
     names = {_center_name(im) for im in imgs}
     for L in list(v.layers):
         if isinstance(L, NapariPoints) and L.name.startswith(CENTER_TAG) and L.name not in names:
@@ -566,33 +425,6 @@ def _rebuild_centers(v):
                 v.layers.remove(L)
             except Exception:
                 pass
-    _force_pair_order(v)
-    imgs = [im for im in _images(v)
-            if not (getattr(im, "metadata", {}) or {}).get("_slice_compare")]
-    if not imgs:
-        _remove_all_centers(v)
-        return
-
-    for im in imgs:
-        _ensure_center(v, im)
-
-    # delete stale points
-    names = set(_center_name(im) for im in imgs)
-    for L in list(v.layers):
-        if isinstance(L, NapariPoints) and L.name.startswith(CENTER_TAG) and L.name not in names:
-            try:
-                v.layers.remove(L)
-            except Exception:
-                pass
-    _force_pair_order(v)
-    if not _images(v): _remove_all_centers(v); return
-    for im in _images(v): _ensure_center(v, im)
-    # delete stale points
-    names = set(_center_name(im) for im in _images(v))
-    for L in list(v.layers):
-        if isinstance(L, NapariPoints) and L.name.startswith(CENTER_TAG) and L.name not in names:
-            try: v.layers.remove(L)
-            except Exception: pass
     _force_pair_order(v)
 
 def _sync(centers_on: bool):
@@ -668,7 +500,7 @@ class _LoadUI:
             w.setMinimumHeight(32)
 
         root = QWidget(); v = QVBoxLayout(root); v.setContentsMargins(14,14,14,14); v.setSpacing(12)
-        title = QLabel("Load RAW/BIN (auto-infer dtype & shape; supports 256×512×512 or 512^3 in filename)")
+        title = QLabel("Load RAW (auto-infer dtype & shape; supports 256×512×512 or 512^3 in filename)")
         title.setStyleSheet("font-weight:600; font-size:14px;"); v.addWidget(title)
 
         r0 = QHBoxLayout(); r0.addWidget(self.btn_add_files.native); r0.addWidget(self.btn_add_folder.native)
@@ -693,8 +525,8 @@ class _LoadUI:
 
     def _pick_files(self):
         start = self.s.last_dir if self.s.last_dir and pathlib.Path(self.s.last_dir).exists() else ""
-        paths,_ = QFileDialog.getOpenFileNames(None,"Add RAW/BIN files",start,
-                    "RAW/BIN (*.raw *.RAW *.bin *.BIN);;All files (*)")
+        paths,_ = QFileDialog.getOpenFileNames(None,"Add RAW files",start,
+                    "RAW (*.raw *.RAW *.bin *.BIN);;All files (*)")
         if paths:
             self.state.files = list(paths); self.pick.clear()
             for p in paths: QListWidgetItem(pathlib.Path(p).name, self.pick)
@@ -702,11 +534,11 @@ class _LoadUI:
 
     def _pick_folder(self):
         start = self.s.last_dir if self.s.last_dir and pathlib.Path(self.s.last_dir).exists() else ""
-        folder = QFileDialog.getExistingDirectory(None,"Pick folder with RAW/BIN",start)
+        folder = QFileDialog.getExistingDirectory(None,"Pick folder with RAW",start)
         if not folder: return
         exts = {".raw",".RAW",".bin",".BIN"}
         files = [str(pathlib.Path(folder)/f) for f in sorted(os.listdir(folder)) if pathlib.Path(f).suffix in exts]
-        if not files: show_warning("No RAW/BIN files in that folder."); return
+        if not files: show_warning("No RAW files in that folder."); return
         self.state.folder_files = files; self.pick.clear()
         for p in files: QListWidgetItem(pathlib.Path(p).name, self.pick)
         _remember_dir(self.s, files[0])
@@ -726,7 +558,6 @@ class _LoadUI:
         for p in paths:
             _ = _load_one(p, dtype if (self.use_hints.value or dtype!="auto") else "auto", Z, Y, X, bool(self.memmap.value))
 
-        # snapshot a few prefs
         try: self.s.default_dtype = dtype; self.s.prefer_memmap = bool(self.memmap.value); self.s.save()
         except Exception: pass
 
@@ -746,7 +577,6 @@ class _LoadUI:
                     if isinstance(L, NapariImage) and L.name == it.text():
                         try: v.layers.remove(L)
                         except Exception: pass
-                # remove its dot
                 for P in list(v.layers):
                     if isinstance(P, NapariPoints) and P.name == f"{CENTER_TAG}{it.text()}":
                         try: v.layers.remove(P)
@@ -777,42 +607,49 @@ def raw_loader_widget() -> QWidget:
 
     show_info(PLUGIN_BUILD)
 
+    # 🔥 Start fresh recipe each time widget is created
+    try:
+        if reset_global_recorder is not None:
+            reset_global_recorder()
+    except Exception:
+        pass
+
     tabs = QTabWidget()
 
     # --- Load tab (always built) ---
     ui = _LoadUI(s)
     load_tab = ui.widget
-    load_tab_index = tabs.addTab(load_tab, "Load")
+    load_tab_index = tabs.addTab(load_tab, "Raw Loader")
 
-    # --- Crop / Tools tab (eager, usually cheap) ---
+    # --- Crop tab (eager) ---
     crop_ctrl, crop_panel = make_crop_panel()
     crop_tab = _pad(crop_panel)
-    crop_tab_index = tabs.addTab(crop_tab, "Crop / Tools")
+    crop_tab_index = tabs.addTab(crop_tab, "Crop")
 
     # --- Slice compare tab (eager) ---
     _, slice_panel = make_slice_compare_panel()
     slice_tab = _pad(slice_panel)
     slice_tab_index = tabs.addTab(slice_tab, "Slice compare")
 
-    # --- 3D View tab (eager, kept as separate module) ---
+    # --- 3D View tab (eager) ---
     from .view3d import _make_view3d_tab
     view3d_tab = _make_view3d_tab()
     view3d_tab_index = tabs.addTab(view3d_tab, "3D View")
 
     # ------------------------------------------------------------------
-    # HEAVY TABS: Plot Lab / Info / Export / Functions → LAZY BUILT
+    # HEAVY TABS: Plot / Export / Functions / Brush / MONAI → LAZY BUILT
     # ------------------------------------------------------------------
     plot_tab = QWidget()
     plot_tab_layout = QVBoxLayout(plot_tab)
     plot_tab_layout.setContentsMargins(0, 0, 0, 0)
     plot_tab_layout.setSpacing(0)
-    plot_tab_index = tabs.addTab(plot_tab, "Plot Lab")
+    plot_tab_index = tabs.addTab(plot_tab, "Plotting")
 
     info_tab = QWidget()
     info_tab_layout = QVBoxLayout(info_tab)
     info_tab_layout.setContentsMargins(0, 0, 0, 0)
     info_tab_layout.setSpacing(0)
-    info_tab_index = tabs.addTab(info_tab, "Info / Export")
+    info_tab_index = tabs.addTab(info_tab, "Export")
 
     fn_tab = QWidget()
     fn_tab_layout = QVBoxLayout(fn_tab)
@@ -824,22 +661,35 @@ def raw_loader_widget() -> QWidget:
     brush_tab_layout = QVBoxLayout(brush_tab)
     brush_tab_layout.setContentsMargins(0, 0, 0, 0)
     brush_tab_layout.setSpacing(0)
-    brush_tab_index = tabs.addTab(brush_tab, "Brush / SAM")
+    brush_tab_index = tabs.addTab(brush_tab, "Brushi")
 
-    # Lazy-built objects + flags
+    monai_tab = QWidget()
+    monai_tab_layout = QVBoxLayout(monai_tab)
+    monai_tab_layout.setContentsMargins(0, 0, 0, 0)
+    monai_tab_layout.setSpacing(0)
+    monai_tab_index = tabs.addTab(monai_tab, "MONAI Segment")
+
+        # --- Session tab (always built, very light) ---
+    try:
+        session_panel = make_session_recorder_panel() if make_session_recorder_panel else QWidget()
+    except Exception:
+        session_panel = QWidget()
+    session_tab = _pad(session_panel)
+    session_tab_index = tabs.addTab(session_tab, "Session")
+
     plotlab = None
     info_widget = None
-    info_refresh = lambda: None  # stub until real one is built
+    info_refresh = lambda: None
     fn_page = None
     brush_page = None
+    monai_page = None
+    built_monai = False
 
     built_plot = False
     built_info = False
     built_fn = False
     built_brush = False
 
-
-    # --- outer wrapper (scroll etc.) ---
     outer = QWidget()
     pl = QVBoxLayout(outer)
     pl.setContentsMargins(0, 0, 0, 0)
@@ -847,7 +697,6 @@ def raw_loader_widget() -> QWidget:
     pl.addWidget(tabs)
     wrapper = _wrap_scroll(outer)
 
-    # Helper to re-apply width caps whenever we add a heavy widget
     def _apply_cap_width():
         try:
             cap_width(
@@ -859,10 +708,8 @@ def raw_loader_widget() -> QWidget:
                 wrapper=wrapper,
             )
         except Exception:
-            # helpers fallback no-ops are fine; don't crash the plugin
             pass
 
-    # --- lazy builders for heavy tabs --------------------------------
     def _ensure_plotlab():
         nonlocal plotlab, built_plot
         if built_plot:
@@ -898,7 +745,7 @@ def raw_loader_widget() -> QWidget:
         if built_fn:
             return
         try:
-            fn_pg = functions_widget()  # magicgui Container
+            fn_pg = functions_widget()
             fn_qwidget = fn_pg.native if hasattr(fn_pg, "native") else fn_pg
             fn_tab_layout.addWidget(_pad(fn_qwidget))
             fn_page = fn_pg
@@ -911,7 +758,7 @@ def raw_loader_widget() -> QWidget:
         if built_brush:
             return
         try:
-            brush_pg = brush_widget()  # magicgui Container
+            brush_pg = brush_widget()
             brush_qwidget = brush_pg.native if hasattr(brush_pg, "native") else brush_pg
             brush_tab_layout.addWidget(_pad(brush_qwidget))
             brush_page = brush_pg
@@ -919,28 +766,38 @@ def raw_loader_widget() -> QWidget:
         except Exception as e:
             show_warning(f"Brush page failed to build: {e!r}")
 
+    def _ensure_monai():
+        nonlocal monai_page, built_monai
+        if built_monai:
+            return
+        if make_monai_infer_widget is None:
+            show_warning("MONAI tab not available (missing monai_infer_widget.py or deps).")
+            built_monai = True
+            return
+        try:
+            monai_pg = make_monai_infer_widget()
+            monai_qwidget = monai_pg.native if hasattr(monai_pg, "native") else monai_pg
+            monai_tab_layout.addWidget(_pad(monai_qwidget))
+            monai_page = monai_pg
+            built_monai = True
+        except Exception as e:
+            show_warning(f"MONAI page failed to build: {e!r}")
 
-
-    # Initial width cap (before heavy tabs exist, it's basically a no-op)
     _apply_cap_width()
 
-    # ---------------- viewer wiring (very light) ----------------------
     v = current_viewer()
     if v:
         wire_caption_events_once()
 
         def _on_layers(event=None, *_):
-            # SUPER LIGHT: just refresh what belongs to the *active* tab.
             if _IN_SYNC:
                 return
 
             current = tabs.currentIndex()
 
-            # Only touch the loaded-list when the "Load" tab is active
             if current == load_tab_index:
                 ui._refresh_loaded_list()
 
-            # Only recompute Info/Export when its tab is active
             if current == info_tab_index and built_info:
                 try:
                     info_refresh()
@@ -950,22 +807,25 @@ def raw_loader_widget() -> QWidget:
         v.layers.events.inserted.connect(_on_layers)
         v.layers.events.removed.connect(_on_layers)
         v.layers.events.reordered.connect(_on_layers)
-        v.layers.selection.events.active.connect(crop_ctrl.on_layers_changed)
 
+        # guard: crop_ctrl could be None if crop import failed
+        try:
+            if crop_ctrl is not None:
+                v.layers.selection.events.active.connect(crop_ctrl.on_layers_changed)
+        except Exception:
+            pass
 
-        # captions react only to active-layer change (very cheap)
         v.layers.selection.events.active.connect(
             lambda *_: refresh_all_captions("bottom")
         )
 
-        # ---------------- tab change wiring (lazy + state) -------------
-        # set initial active tab
         set_active_tab("load")
 
         def _on_tab_changed(idx: int):
-            # 1) Update global tab state (for plots/info modules using is_tab_active)
             if idx == load_tab_index:
                 set_active_tab("load")
+            elif idx == session_tab_index:
+                set_active_tab("session")
             elif idx == plot_tab_index:
                 set_active_tab("plot")
             elif idx == info_tab_index:
@@ -980,10 +840,11 @@ def raw_loader_widget() -> QWidget:
                 set_active_tab("slice")
             elif idx == view3d_tab_index:
                 set_active_tab("view3d")
+            elif idx == monai_tab_index:
+                set_active_tab("monai")
             else:
                 set_active_tab(f"tab_{idx}")
 
-            # 2) Ensure heavy tabs are built on first use
             if idx == plot_tab_index:
                 _ensure_plotlab()
             elif idx == info_tab_index:
@@ -992,13 +853,12 @@ def raw_loader_widget() -> QWidget:
                 _ensure_functions()
             elif idx == brush_tab_index:
                 _ensure_brush()
+            elif idx == monai_tab_index:
+                _ensure_monai()
 
-            # 3) Do a light refresh now that active tab changed
             _on_layers()
 
         tabs.currentChanged.connect(_on_tab_changed)
-
-        # initial update (respect active-tab gating)
         _on_layers()
 
     return wrapper
