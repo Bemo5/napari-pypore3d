@@ -1,568 +1,1066 @@
-# napari_pypore3d/functions.py — r15 (SAFE MODE)
-# - ONLY uint8 pipeline
-# - NO crashy/slow ops (no NLM/bilateral/aniso/CLAHE/hist-eq)
-# - Hard guards against huge volumes
-# - Uses SciPy ndimage for robust N-D filtering
-
+# napari_pypore3d/functions.py — r19 FIXED
+# Scientist Mode + session recipe + sane placement + correct preview scaling
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Dict, Optional, List, Tuple
+from pathlib import Path
+from typing import Optional, Dict, Callable, Any, Tuple
+import os
+import tempfile
+from uuid import uuid4
 
 import numpy as np
 
-from magicgui.widgets import Container, ComboBox, PushButton, Label
-try:
-    from magicgui.widgets import LineEdit
-except Exception:
-    LineEdit = None  # type: ignore
-
-try:
-    from magicgui.widgets import TextEdit
-except Exception:
-    TextEdit = None  # type: ignore
-
 from napari import current_viewer
 from napari.layers import Image as NapariImage
+from napari.layers import Labels as NapariLabels
 from napari.utils.notifications import show_info, show_warning, show_error
 
-# Optional SciPy (recommended)
+from qtpy.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QComboBox, QSpinBox, QPushButton, QPlainTextEdit,
+    QGroupBox, QFrame, QSizePolicy, QCheckBox
+)
+
+# Session recipe
+from .session_recorder import RECORDER, register_handler, Step
+
+# napari worker to avoid UI freeze
 try:
-    from scipy import ndimage as ndi
-except Exception:  # pragma: no cover
-    ndi = None
+    from napari.qt.threading import thread_worker
+except Exception:
+    thread_worker = None  # type: ignore
 
-# Optional skimage (only for otsu + clear_border; both are typically safe)
+# ---------------------------------------------------------------------
+# PyPore3D imports (FILT + BLOB)
+# ---------------------------------------------------------------------
+_HAVE_FILT = False
+_HAVE_BLOB = False
+
 try:
-    from skimage.filters import threshold_otsu
-except Exception:  # pragma: no cover
-    threshold_otsu = None
+    from pypore3d.p3dFiltPy import (
+        py_p3dReadRaw8,
+        py_p3dWriteRaw8,
+        py_p3dMedianFilter8,
+        py_p3dMeanFilter8,
+        py_p3dGaussianFilter8,
+        py_p3dAutoThresholding8,
+        py_p3dClearBorderFilter8,
+        py_printErrorMessage as _p3d_err_filt,
+    )
+    _HAVE_FILT = True
+except Exception:
+    py_p3dReadRaw8 = py_p3dWriteRaw8 = None  # type: ignore
+    py_p3dMedianFilter8 = py_p3dMeanFilter8 = py_p3dGaussianFilter8 = None  # type: ignore
+    py_p3dAutoThresholding8 = py_p3dClearBorderFilter8 = None  # type: ignore
+    _p3d_err_filt = None  # type: ignore
 
 try:
-    from skimage.segmentation import clear_border
-except Exception:  # pragma: no cover
-    clear_border = None
+    from pypore3d.p3dBlobPy import (
+        py_p3dMinVolumeFilter3D,
+        py_p3dBlobLabeling,
+        py_printErrorMessage as _p3d_err_blob,
+    )
+    _HAVE_BLOB = True
+except Exception:
+    py_p3dMinVolumeFilter3D = py_p3dBlobLabeling = None  # type: ignore
+    _p3d_err_blob = None  # type: ignore
 
+# ---------------------------------------------------------------------
+# Settings (tuned for big volumes)
+# ---------------------------------------------------------------------
+_PREVIEW_TARGET_VOXELS = 30_000_000
+_FULL_SAFE_VOXELS = 180_000_000
+_FULL_ABS_MAX_VOXELS = 700_000_000
 
-# --------------------------------------------------------------------- types --
-
-@dataclass
-class FunctionEntry:
-    label: str
-    runner: Callable[[NapariImage], Optional[np.ndarray]]
-    tooltip: str = ""
-
-
-# ------------------------------------------------------------------- helpers --
-
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 def _v():
-    return current_viewer()
-
-def _get_image_layers() -> List[NapariImage]:
-    v = _v()
-    if v is None:
-        return []
-    return [L for L in v.layers if isinstance(L, NapariImage)]
-
-def _pick_layer_by_name(name: Optional[str]) -> Optional[NapariImage]:
-    v = _v()
-    if v is None:
+    try:
+        return current_viewer()
+    except Exception:
         return None
 
-    imgs = [L for L in v.layers if isinstance(L, NapariImage)]
-    if not imgs:
-        return None
+def _now() -> str:
+    return datetime.now().strftime("[%H:%M:%S]")
 
-    if not name or name == "<active image>":
-        lyr = v.layers.selection.active
-        return lyr if isinstance(lyr, NapariImage) else imgs[0]
+def _ensure_2d_or_3d(a: np.ndarray) -> np.ndarray:
+    a = np.asarray(a)
+    if a.ndim not in (2, 3):
+        raise ValueError(f"Expected 2D or 3D array, got shape={a.shape!r}")
+    return np.ascontiguousarray(a)
 
-    for L in imgs:
-        if L.name == name:
-            return L
-
-    lyr = v.layers.selection.active
-    return lyr if isinstance(lyr, NapariImage) else imgs[0]
-
-def _clone_visuals(src: NapariImage, dst: NapariImage) -> None:
-    props = [
-        "colormap", "contrast_limits", "gamma", "opacity", "blending",
-        "interpolation", "rendering", "visible", "scale", "translate",
-        "rotate", "shear", "units"
-    ]
-    for p in props:
-        try:
-            setattr(dst, p, getattr(src, p))
-        except Exception:
-            pass
-    try:
-        dst.visible = True
-    except Exception:
-        pass
-
-def _add_result_layer(data: np.ndarray, src: NapariImage, suffix: str) -> NapariImage:
-    v = _v()
-    if v is None:
-        raise RuntimeError("No active napari viewer.")
-    safe_suffix = str(suffix).replace(" ", "_").replace("/", "_")
-    name = f"{src.name}_{safe_suffix}"
-    new_layer = v.add_image(data, name=name)
-    _clone_visuals(src, new_layer)
-    return new_layer
-
-def _reset_contrast(layer: NapariImage, data: np.ndarray) -> None:
-    try:
-        layer.reset_contrast_limits()
-        return
-    except Exception:
-        pass
-    try:
-        lo = float(np.nanmin(data))
-        hi = float(np.nanmax(data))
-        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
-            layer.contrast_limits = (lo, hi)
-    except Exception:
-        pass
-
-def _require_scipy() -> None:
-    if ndi is None:
-        raise RuntimeError("SciPy is required (scipy.ndimage not available).")
-
-def _require_skimage_otsu() -> None:
-    if threshold_otsu is None:
-        raise RuntimeError("scikit-image is required (skimage.filters.threshold_otsu not available).")
-
-def _require_skimage_clear_border() -> None:
-    if clear_border is None:
-        raise RuntimeError("scikit-image is required (skimage.segmentation.clear_border not available).")
-
-def _ensure_2d_or_3d(arr: np.ndarray) -> np.ndarray:
-    if arr.ndim not in (2, 3):
-        raise ValueError(f"Expected 2D or 3D image/volume, got shape {arr.shape!r}")
-    return np.ascontiguousarray(arr)
-
-def _kernel_size(arr: np.ndarray, radius: int) -> Tuple[int, ...]:
-    k = 2 * int(radius) + 1
-    return (k,) * arr.ndim
-
-def _guard_voxels(arr: np.ndarray, max_voxels: int) -> None:
-    vox = int(np.prod(arr.shape))
-    if vox > int(max_voxels):
-        raise RuntimeError(
-            f"Refused: volume too large ({vox:,} voxels). "
-            f"Safety limit is {max_voxels:,} voxels for this operation."
-        )
+def _voxels(a: np.ndarray) -> int:
+    return int(np.prod(a.shape))
 
 def _to_uint8_fast(src: np.ndarray) -> np.ndarray:
-    """
-    Always create a uint8 working copy:
-    - float: min-max to 0..255
-    - uint16/int: min-max to 0..255
-    - uint8: pass-through (contiguous copy)
-    """
     a = np.asarray(src)
     if a.dtype == np.uint8:
         return np.ascontiguousarray(a)
-
     af = np.asarray(a, dtype=np.float32)
     mn = float(np.nanmin(af))
     mx = float(np.nanmax(af))
     if not (np.isfinite(mn) and np.isfinite(mx)) or mx <= mn:
         return np.zeros_like(af, dtype=np.uint8)
-
     out = (af - mn) / (mx - mn)
     out = (out * 255.0).clip(0, 255).astype(np.uint8)
     return np.ascontiguousarray(out)
 
-def _invert_u8(a: np.ndarray) -> np.ndarray:
-    return (255 - a).astype(np.uint8, copy=False)
+def _napari_to_p3d_u8(arr: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int], bool]:
+    a = np.ascontiguousarray(arr)
+    if a.ndim == 2:
+        u8 = _to_uint8_fast(a).T
+        u8 = u8[:, :, None]
+        x, y, z = u8.shape
+        return np.ascontiguousarray(u8), (x, y, z), False
 
-def _clip_percentiles_u8(a_u8: np.ndarray, p_low: float, p_high: float) -> np.ndarray:
-    lo = float(np.percentile(a_u8, p_low))
-    hi = float(np.percentile(a_u8, p_high))
-    if hi <= lo:
-        return a_u8.copy()
-    out = np.clip(a_u8.astype(np.float32), lo, hi)
-    # rescale back to 0..255 for consistent uint8 output
-    out = (out - lo) / (hi - lo)
-    return (out * 255.0).clip(0, 255).astype(np.uint8)
+    u8 = _to_uint8_fast(a)
+    u8 = np.transpose(u8, (2, 1, 0))  # (Z,Y,X)->(X,Y,Z)
+    x, y, z = u8.shape
+    return np.ascontiguousarray(u8), (x, y, z), True
 
-def _gamma_u8(a_u8: np.ndarray, gamma: float) -> np.ndarray:
-    # LUT = fastest + stable
-    g = float(gamma)
-    if g <= 0:
-        g = 1.0
-    lut = (np.power(np.arange(256, dtype=np.float32) / 255.0, g) * 255.0).clip(0, 255).astype(np.uint8)
-    return lut[a_u8]
+def _p3d_to_napari_u8(p3d_u8: np.ndarray, was_3d: bool) -> np.ndarray:
+    if not was_3d:
+        return np.ascontiguousarray(p3d_u8[:, :, 0].T)
+    return np.ascontiguousarray(np.transpose(p3d_u8, (2, 1, 0)))
 
-def _log_u8(a_u8: np.ndarray) -> np.ndarray:
-    # LUT log1p
-    x = np.arange(256, dtype=np.float32)
-    lut = (np.log1p(x) / np.log1p(255.0) * 255.0).clip(0, 255).astype(np.uint8)
-    return lut[a_u8]
+def _tmp_paths() -> tuple[Path, Path]:
+    tmp_dir = Path(tempfile.gettempdir()) / "napari_pypore3d_p3dtmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"{os.getpid()}_{uuid4().hex}"
+    return (tmp_dir / f"in_{tag}.raw", tmp_dir / f"out_{tag}.raw")
 
-def _sqrt_u8(a_u8: np.ndarray) -> np.ndarray:
-    x = np.arange(256, dtype=np.float32)
-    lut = (np.sqrt(x) / np.sqrt(255.0) * 255.0).clip(0, 255).astype(np.uint8)
-    return lut[a_u8]
-
-
-# ============================================================
-# SAFE intensity ops (uint8 only)
-# ============================================================
-
-def _fn_u8_normalise(layer: NapariImage) -> np.ndarray:
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    return _to_uint8_fast(src)
-
-def _fn_u8_invert(layer: NapariImage) -> np.ndarray:
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    a = _to_uint8_fast(src)
-    return _invert_u8(a)
-
-def _fn_u8_clip_1_99(layer: NapariImage) -> np.ndarray:
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    a = _to_uint8_fast(src)
-    return _clip_percentiles_u8(a, 1.0, 99.0)
-
-def _fn_u8_clip_5_95(layer: NapariImage) -> np.ndarray:
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    a = _to_uint8_fast(src)
-    return _clip_percentiles_u8(a, 5.0, 95.0)
-
-def _fn_u8_gamma_05(layer: NapariImage) -> np.ndarray:
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    a = _to_uint8_fast(src)
-    return _gamma_u8(a, 0.5)
-
-def _fn_u8_gamma_20(layer: NapariImage) -> np.ndarray:
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    a = _to_uint8_fast(src)
-    return _gamma_u8(a, 2.0)
-
-def _fn_u8_log(layer: NapariImage) -> np.ndarray:
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    a = _to_uint8_fast(src)
-    return _log_u8(a)
-
-def _fn_u8_sqrt(layer: NapariImage) -> np.ndarray:
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    a = _to_uint8_fast(src)
-    return _sqrt_u8(a)
-
-
-# ============================================================
-# SAFE smoothing filters (uint8 only, guarded)
-# ============================================================
-
-# These are the only filters that should be allowed in a viewer tab.
-# Guard values are conservative so you don't get "napari hangs".
-_MAX_VOXELS_FILTER = 20_000_000  # ~20M voxels; adjust later if you want
-
-def _fn_u8_median_r1(layer: NapariImage) -> np.ndarray:
-    _require_scipy()
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    _guard_voxels(src, _MAX_VOXELS_FILTER)
-    a = _to_uint8_fast(src)
-    out = ndi.median_filter(a, size=_kernel_size(a, 1))
-    return np.asarray(out, dtype=np.uint8)
-
-def _fn_u8_median_r2(layer: NapariImage) -> np.ndarray:
-    _require_scipy()
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    _guard_voxels(src, _MAX_VOXELS_FILTER)
-    a = _to_uint8_fast(src)
-    out = ndi.median_filter(a, size=_kernel_size(a, 2))
-    return np.asarray(out, dtype=np.uint8)
-
-def _fn_u8_mean_r1(layer: NapariImage) -> np.ndarray:
-    _require_scipy()
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    _guard_voxels(src, _MAX_VOXELS_FILTER)
-    a = _to_uint8_fast(src).astype(np.float32)
-    out = ndi.uniform_filter(a, size=_kernel_size(a, 1))
-    return np.rint(out).clip(0, 255).astype(np.uint8)
-
-def _fn_u8_mean_r2(layer: NapariImage) -> np.ndarray:
-    _require_scipy()
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    _guard_voxels(src, _MAX_VOXELS_FILTER)
-    a = _to_uint8_fast(src).astype(np.float32)
-    out = ndi.uniform_filter(a, size=_kernel_size(a, 2))
-    return np.rint(out).clip(0, 255).astype(np.uint8)
-
-def _fn_u8_gaussian_s1(layer: NapariImage) -> np.ndarray:
-    _require_scipy()
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    _guard_voxels(src, _MAX_VOXELS_FILTER)
-    a = _to_uint8_fast(src).astype(np.float32)
-    out = ndi.gaussian_filter(a, sigma=1.0)
-    return np.rint(out).clip(0, 255).astype(np.uint8)
-
-def _fn_u8_gaussian_s2(layer: NapariImage) -> np.ndarray:
-    _require_scipy()
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    _guard_voxels(src, _MAX_VOXELS_FILTER)
-    a = _to_uint8_fast(src).astype(np.float32)
-    out = ndi.gaussian_filter(a, sigma=2.0)
-    return np.rint(out).clip(0, 255).astype(np.uint8)
-
-
-# ============================================================
-# SAFE segmentation (uint8 only)
-# ============================================================
-
-_MAX_VOXELS_SEG = 50_000_000  # segmentation is usually OK a bit higher
-
-def _fn_u8_mean_threshold(layer: NapariImage) -> np.ndarray:
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    _guard_voxels(src, _MAX_VOXELS_SEG)
-    a = _to_uint8_fast(src)
-    thr = int(np.mean(a))
-    out = np.zeros_like(a, dtype=np.uint8)
-    out[a >= thr] = 255
-    return out
-
-def _fn_u8_otsu(layer: NapariImage) -> np.ndarray:
-    _require_skimage_otsu()
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    _guard_voxels(src, _MAX_VOXELS_SEG)
-    a = _to_uint8_fast(src)
-    thr = int(threshold_otsu(a))
-    out = np.zeros_like(a, dtype=np.uint8)
-    out[a >= thr] = 255
-    return out
-
-def _fn_u8_clear_border(layer: NapariImage) -> np.ndarray:
-    _require_skimage_clear_border()
-    src = _ensure_2d_or_3d(np.asarray(layer.data))
-    _guard_voxels(src, _MAX_VOXELS_SEG)
-    a = _to_uint8_fast(src)
-    # clear_border expects a binary-ish image; do it on nonzero
-    mask = a > 0
-    out = clear_border(mask)
-    return (out.astype(np.uint8) * 255)
-
-
-# ------------------------------------------------------- function registry ---
-
-NORMAL_FUNCTIONS: Dict[str, FunctionEntry] = {
-    # 1) Intensity (safe)
-    "Convert to uint8 (0..255) [SAFE]": FunctionEntry("Convert to uint8 (0..255) [SAFE]", _fn_u8_normalise),
-    "Invert (uint8) [SAFE]": FunctionEntry("Invert (uint8) [SAFE]", _fn_u8_invert),
-    "Clip 1–99% + rescale (uint8) [SAFE]": FunctionEntry("Clip 1–99% + rescale (uint8) [SAFE]", _fn_u8_clip_1_99),
-    "Clip 5–95% + rescale (uint8) [SAFE]": FunctionEntry("Clip 5–95% + rescale (uint8) [SAFE]", _fn_u8_clip_5_95),
-    "Gamma (γ=0.5) (uint8 LUT) [SAFE]": FunctionEntry("Gamma (γ=0.5) (uint8 LUT) [SAFE]", _fn_u8_gamma_05),
-    "Gamma (γ=2.0) (uint8 LUT) [SAFE]": FunctionEntry("Gamma (γ=2.0) (uint8 LUT) [SAFE]", _fn_u8_gamma_20),
-    "Log (uint8 LUT) [SAFE]": FunctionEntry("Log (uint8 LUT) [SAFE]", _fn_u8_log),
-    "Sqrt (uint8 LUT) [SAFE]": FunctionEntry("Sqrt (uint8 LUT) [SAFE]", _fn_u8_sqrt),
-
-    # 2) Filters (safe, guarded)
-    "Median filter (r=1) (uint8) [SAFE]": FunctionEntry("Median filter (r=1) (uint8) [SAFE]", _fn_u8_median_r1),
-    "Median filter (r=2) (uint8) [SAFE]": FunctionEntry("Median filter (r=2) (uint8) [SAFE]", _fn_u8_median_r2),
-    "Mean / box filter (r=1) (uint8) [SAFE]": FunctionEntry("Mean / box filter (r=1) (uint8) [SAFE]", _fn_u8_mean_r1),
-    "Mean / box filter (r=2) (uint8) [SAFE]": FunctionEntry("Mean / box filter (r=2) (uint8) [SAFE]", _fn_u8_mean_r2),
-    "Gaussian blur (σ=1) (uint8) [SAFE]": FunctionEntry("Gaussian blur (σ=1) (uint8) [SAFE]", _fn_u8_gaussian_s1),
-    "Gaussian blur (σ=2) (uint8) [SAFE]": FunctionEntry("Gaussian blur (σ=2) (uint8) [SAFE]", _fn_u8_gaussian_s2),
-
-    # 3) Thresholding (safe, guarded)
-    "Mean threshold → binary (0/255) [SAFE]": FunctionEntry("Mean threshold → binary (0/255) [SAFE]", _fn_u8_mean_threshold),
-    "Otsu threshold → binary (0/255) [SAFE]": FunctionEntry("Otsu threshold → binary (0/255) [SAFE]", _fn_u8_otsu),
-    "Clear border (binary) [SAFE]": FunctionEntry("Clear border (binary) [SAFE]", _fn_u8_clear_border),
-}
-
-ALL_KEYS = list(NORMAL_FUNCTIONS.keys())
-
-
-# --------------------------------------------------------------- main widget --
-
-def functions_widget() -> Container:
-    header = Label(label="", value="Target layer: <active image> or pick by name.")
-
-    layer_combo = ComboBox(label="Layer", choices=["<active image>"], value="<active image>")
-
-    def refresh_layers(*_):
-        layers = _get_image_layers()
-        names = ["<active image>"] + [L.name for L in layers]
-        current = layer_combo.value if layer_combo.value in names else "<active image>"
-        layer_combo.choices = names
-        layer_combo.value = current
-
-    refresh_layers()
-
-    search_label = Label(label="", value="Search (filters the list):")
-
-    if LineEdit is not None:
-        search_box = LineEdit(label="", value="")
+def _cleanup(*paths: Path) -> None:
+    for p in paths:
         try:
-            search_box.native.setPlaceholderText("type e.g. uint8 / median / gaussian / otsu ...")
+            if p.exists():
+                p.unlink()
         except Exception:
             pass
-    elif TextEdit is not None:
-        search_box = TextEdit(label="", value="")
+
+def _p3d_call3d(fn, vol, x: int, y: int, z: int):
+    try:
+        return fn(vol, x, y, dimz=z)
+    except TypeError:
+        return fn(vol, x, y, z)
+
+def _p3d_call3d_minvol(fn, vol, x: int, y: int, z: int, minvol: int):
+    mv = int(minvol)
+    last = None
+    try:
+        return fn(vol, x, y, z, mv)
+    except TypeError as e:
+        last = e
+    try:
+        return fn(vol, x, y, z, minvol=mv)
+    except TypeError as e:
+        last = e
+    try:
+        return fn(vol, x, y, dimz=z, minvol=mv)
+    except TypeError as e:
+        last = e
+    try:
+        return fn(vol, x, y, mv, dimz=z)
+    except TypeError as e:
+        last = e
+    raise TypeError(f"MinVolumeFilter3D call failed. Last error: {last!r}")
+
+def _reset_contrast(layer: NapariImage) -> None:
+    try:
+        layer.reset_contrast_limits()
+    except Exception:
+        pass
+
+def _short_name(src_name: str, op: str, mode: str, extra: str = "") -> str:
+    base = src_name
+    if len(base) > 22:
+        base = base[:19] + "…"
+    tag = "PREV" if mode.lower().startswith("preview") else "FULL"
+    s = f"{base} | {op} [{tag}]"
+    if extra:
+        s += f" {extra}"
+    return s
+
+def _downsample_stride_for_target(voxels: int, target: int) -> int:
+    if voxels <= target:
+        return 1
+    s = int(np.ceil((voxels / float(target)) ** (1.0 / 3.0)))
+    return max(2, s)
+
+def _downsample(a: np.ndarray, stride: int) -> np.ndarray:
+    if stride <= 1:
+        return a
+    if a.ndim == 2:
+        return np.ascontiguousarray(a[::stride, ::stride])
+    return np.ascontiguousarray(a[::stride, ::stride, ::stride])
+
+def _inherit_transform_and_fix_stride(src: Any, dst: Any, stride: int) -> None:
+    """
+    Copy spatial metadata AND fix preview downsample scaling:
+      - If we downsample by stride, each pixel represents stride*src.scale
+      - So dst.scale = src.scale * stride  (per axis)
+    """
+    # Copy translate first (origin)
+    try:
+        if hasattr(src, "translate") and hasattr(dst, "translate"):
+            dst.translate = src.translate
+    except Exception:
+        pass
+
+    # Copy scale then multiply by stride
+    try:
+        if hasattr(src, "scale") and hasattr(dst, "scale"):
+            s = np.array(getattr(src, "scale", (1, 1, 1)), dtype=float)
+            if s.size >= 1:
+                s = s * float(stride)
+            dst.scale = tuple(s.tolist())
+    except Exception:
+        # fallback: do nothing
+        pass
+
+    # Copy rotate/shear if present
+    for attr in ("rotate", "shear"):
         try:
-            search_box.native.setMaximumHeight(32)
+            if hasattr(src, attr) and hasattr(dst, attr):
+                setattr(dst, attr, getattr(src, attr))
         except Exception:
             pass
+
+def _is_maskish(op: str) -> bool:
+    op = op.lower()
+    return any(k in op for k in ["autothreshold", "minvol", "clearborder", "presetfastmask", "presetcleanlabel", "bloblabeling"])
+
+def _to_labels_array(out_u8: np.ndarray) -> np.ndarray:
+    """
+    Convert uint8-ish output to labels:
+      - threshold outputs are typically 0/255 (or 0/1)
+      - blob labeling returns labeled ints (but stored in uint8)
+    """
+    a = np.asarray(out_u8)
+    # make 0/255 -> 0/1
+    if a.dtype == np.uint8:
+        # fast check on a small sample
+        flat = a.ravel()
+        if flat.size:
+            samp = flat[:: max(1, flat.size // 4096)]
+            mx = int(samp.max())
+            if mx == 255:
+                a = (a > 0).astype(np.uint16)
+            else:
+                a = a.astype(np.uint16, copy=False)
+        else:
+            a = a.astype(np.uint16, copy=False)
     else:
-        search_box = None
+        a = a.astype(np.uint16, copy=False)
+    return np.ascontiguousarray(a)
 
-    count_label = Label(label="", value=f"Showing {len(ALL_KEYS)} functions")
+# ---------------------------------------------------------------------
+# Core runners (uint8 bridge)
+# ---------------------------------------------------------------------
+def _require_filt():
+    if not _HAVE_FILT:
+        raise RuntimeError("PyPore3D FILT wrappers missing (pypore3d.p3dFiltPy import failed).")
 
-    func_label = Label(label="", value="Functions:")
-    func_combo = ComboBox(label="", choices=ALL_KEYS, value=ALL_KEYS[0] if ALL_KEYS else None)
+def _require_blob():
+    if not _HAVE_BLOB:
+        raise RuntimeError("PyPore3D BLOB wrappers missing (pypore3d.p3dBlobPy import failed).")
 
-    output_label = Label(label="", value="Output mode:")
-    output_combo = ComboBox(label="", choices=["new layer", "overwrite target"], value="new layer")
+def _run_filt_u8(arr: np.ndarray, op_name: str, fn) -> np.ndarray:
+    _require_filt()
+    src = _ensure_2d_or_3d(arr)
+    p3d_u8, (x, y, z), was_3d = _napari_to_p3d_u8(src)
+    in_path, out_path = _tmp_paths()
+    p3d_u8.ravel(order="C").tofile(in_path)
 
-    run_btn = PushButton(text="Run selected")
-
-    console_title = Label(label="", value="Activity Log:")
-
-    if TextEdit is not None:
-        console = TextEdit(label="", value="")
+    try:
+        v = py_p3dReadRaw8(str(in_path), x, y, dimz=z)
+        v2 = _p3d_call3d(fn, v, x, y, z)
+        py_p3dWriteRaw8(v2, str(out_path), x, y, dimz=z)
+    except Exception as e:
         try:
-            console.native.setReadOnly(True)
-            console.native.setMinimumHeight(180)
-            console.native.setStyleSheet(
-                "background-color:#000000;color:#FFFFFF;font-family:Consolas,monospace;font-size:10pt;"
+            if _p3d_err_filt:
+                _p3d_err_filt()
+        except Exception:
+            pass
+        _cleanup(in_path, out_path)
+        raise RuntimeError(f"PyPore3D failed ({op_name}): {e!r}") from e
+
+    out = np.fromfile(out_path, dtype=np.uint8)
+    _cleanup(in_path, out_path)
+    if out.size != x * y * z:
+        raise RuntimeError(f"Output size mismatch: got {out.size}, expected {x*y*z}")
+
+    out_p3d = out.reshape((x, y, z), order="C")
+    return _p3d_to_napari_u8(out_p3d, was_3d)
+
+def _run_minvol_u8(arr: np.ndarray, minvol: int) -> np.ndarray:
+    _require_filt()
+    _require_blob()
+
+    src = _ensure_2d_or_3d(arr)
+    u8_src = _to_uint8_fast(src)
+
+    p3d_u8, (x, y, z), was_3d = _napari_to_p3d_u8(u8_src)
+    in_path, out_path = _tmp_paths()
+    p3d_u8.ravel(order="C").tofile(in_path)
+
+    try:
+        v = py_p3dReadRaw8(str(in_path), x, y, dimz=z)
+        v2 = _p3d_call3d_minvol(py_p3dMinVolumeFilter3D, v, x, y, z, minvol=minvol)
+        py_p3dWriteRaw8(v2, str(out_path), x, y, dimz=z)
+    except Exception as e:
+        try:
+            if _p3d_err_blob:
+                _p3d_err_blob()
+        except Exception:
+            pass
+        _cleanup(in_path, out_path)
+        raise RuntimeError(f"PyPore3D failed (MinVolumeFilter3D): {e!r}") from e
+
+    out = np.fromfile(out_path, dtype=np.uint8)
+    _cleanup(in_path, out_path)
+    if out.size != x * y * z:
+        raise RuntimeError(f"Output size mismatch: got {out.size}, expected {x*y*z}")
+
+    out_p3d = out.reshape((x, y, z), order="C")
+    return _p3d_to_napari_u8(out_p3d, was_3d)
+
+def _run_blob_label_u8(arr: np.ndarray) -> np.ndarray:
+    _require_filt()
+    _require_blob()
+
+    src = _ensure_2d_or_3d(arr)
+    u8_src = _to_uint8_fast(src)
+
+    p3d_u8, (x, y, z), was_3d = _napari_to_p3d_u8(u8_src)
+    in_path, out_path = _tmp_paths()
+    p3d_u8.ravel(order="C").tofile(in_path)
+
+    try:
+        v = py_p3dReadRaw8(str(in_path), x, y, dimz=z)
+        v2 = _p3d_call3d(py_p3dBlobLabeling, v, x, y, z)
+        py_p3dWriteRaw8(v2, str(out_path), x, y, dimz=z)
+    except Exception as e:
+        try:
+            if _p3d_err_blob:
+                _p3d_err_blob()
+        except Exception:
+            pass
+        _cleanup(in_path, out_path)
+        raise RuntimeError(f"PyPore3D failed (BlobLabeling): {e!r}") from e
+
+    out = np.fromfile(out_path, dtype=np.uint8)
+    _cleanup(in_path, out_path)
+    if out.size != x * y * z:
+        raise RuntimeError(f"Output size mismatch: got {out.size}, expected {x*y*z}")
+
+    out_p3d = out.reshape((x, y, z), order="C")
+    return _p3d_to_napari_u8(out_p3d, was_3d)
+
+# ---------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------
+@dataclass
+class _Job:
+    op: str
+    fn: Callable[[], np.ndarray]
+    mode: str
+    stride: int
+    src_name: str
+    output: str  # "new" or "overwrite"
+    minvol: int = 0
+    allow_huge: bool = False
+    preset: str = ""
+
+def functions_widget() -> QWidget:
+    root = QWidget()
+    root.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+
+    outer = QVBoxLayout(root)
+    outer.setContentsMargins(10, 10, 10, 10)
+    outer.setSpacing(10)
+
+    title = QLabel("PyPore3D Workflow (Scientist Mode)")
+    title.setStyleSheet("font-size: 12pt; font-weight: 600;")
+    outer.addWidget(title)
+
+    subtitle = QLabel("Preview = auto-downsample for huge volumes. Full = run on full resolution (guarded).")
+    subtitle.setStyleSheet("opacity: 0.85;")
+    subtitle.setWordWrap(True)
+    outer.addWidget(subtitle)
+
+    # ---------- top controls ----------
+    top = QGridLayout()
+    top.setHorizontalSpacing(10)
+    top.setVerticalSpacing(6)
+
+    lbl_layer = QLabel("Target layer")
+    cmb_layer = QComboBox()
+    cmb_layer.addItem("<active image>")
+
+    lbl_mode = QLabel("Run mode")
+    cmb_mode = QComboBox()
+    cmb_mode.addItems(["Preview (auto-downsample)", "Full (original resolution)"])
+
+    lbl_out = QLabel("Output")
+    cmb_out = QComboBox()
+    cmb_out.addItems(["new layer", "overwrite target"])
+
+    lbl_minvol = QLabel("Min volume (voxels)")
+    spn_minvol = QSpinBox()
+    spn_minvol.setRange(0, 50_000_000)
+    spn_minvol.setValue(50)
+    spn_minvol.setSingleStep(10)
+
+    chk_allow_huge = QCheckBox("Allow huge (unsafe)")
+    chk_allow_huge.setToolTip("If enabled, Full mode can run up to a very high limit. Might be slow.")
+
+    top.addWidget(lbl_layer, 0, 0)
+    top.addWidget(cmb_layer, 0, 1)
+    top.addWidget(lbl_mode, 1, 0)
+    top.addWidget(cmb_mode, 1, 1)
+    top.addWidget(lbl_out, 2, 0)
+    top.addWidget(cmb_out, 2, 1)
+    top.addWidget(lbl_minvol, 3, 0)
+    top.addWidget(spn_minvol, 3, 1)
+    top.addWidget(chk_allow_huge, 4, 0, 1, 2)
+
+    outer.addLayout(top)
+
+    line = QFrame()
+    line.setFrameShape(QFrame.HLine)
+    line.setFrameShadow(QFrame.Sunken)
+    outer.addWidget(line)
+
+    # ---------- groups ----------
+    def group(title_text: str) -> tuple[QGroupBox, QVBoxLayout]:
+        g = QGroupBox(title_text)
+        g.setStyleSheet("QGroupBox { font-weight: 600; }")
+        lay = QVBoxLayout(g)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+        return g, lay
+
+    def big_button(text: str, tip: str = "") -> QPushButton:
+        b = QPushButton(text)
+        b.setMinimumHeight(34)
+        b.setToolTip(tip)
+        b.setStyleSheet("QPushButton { font-size: 10pt; padding: 6px 10px; }")
+        return b
+
+    g_pre, lay_pre = group("Preprocess")
+    g_mask, lay_mask = group("Mask")
+    g_clean, lay_clean = group("Clean")
+    g_lab, lay_lab = group("Label")
+    g_presets, lay_presets = group("Presets")
+
+    btn_median = big_button("Median filter (8-bit)", "py_p3dMedianFilter8 (uint8)")
+    btn_mean = big_button("Mean filter (8-bit)", "py_p3dMeanFilter8 (uint8)")
+    btn_gauss = big_button("Gaussian filter (8-bit)", "py_p3dGaussianFilter8 (uint8)")
+    lay_pre.addWidget(btn_median)
+    lay_pre.addWidget(btn_mean)
+    lay_pre.addWidget(btn_gauss)
+
+    btn_thresh = big_button("Make mask (AutoThreshold)", "py_p3dAutoThresholding8 (uint8)")
+    lay_mask.addWidget(btn_thresh)
+
+    btn_minvol = big_button("Remove small blobs (MinVolume)", "py_p3dMinVolumeFilter3D (uses Min volume)")
+    btn_clear = big_button("Clear border", "py_p3dClearBorderFilter8 (mask-ish)")
+    lay_clean.addWidget(btn_minvol)
+    lay_clean.addWidget(btn_clear)
+
+    btn_label = big_button("Label blobs (BlobLabeling)", "py_p3dBlobLabeling → labels (uint8)")
+    lay_lab.addWidget(btn_label)
+
+    btn_preset_fast = big_button("Fast mask preset: threshold → minvol → clear", "One-click quick mask pipeline")
+    btn_preset_label = big_button("Clean + label preset: minvol → clear → label", "Assumes input is mask-ish")
+    lay_presets.addWidget(btn_preset_fast)
+    lay_presets.addWidget(btn_preset_label)
+
+    # Two-column layout
+    cols = QHBoxLayout()
+    cols.setSpacing(10)
+    left = QVBoxLayout()
+    right = QVBoxLayout()
+    left.setSpacing(10)
+    right.setSpacing(10)
+    left.addWidget(g_pre)
+    left.addWidget(g_mask)
+    right.addWidget(g_clean)
+    right.addWidget(g_lab)
+    cols.addLayout(left, 1)
+    cols.addLayout(right, 1)
+    outer.addLayout(cols)
+    outer.addWidget(g_presets)
+
+    # ---------- log ----------
+    log_title = QLabel("Log")
+    log_title.setStyleSheet("font-weight: 600;")
+    outer.addWidget(log_title)
+
+    log = QPlainTextEdit()
+    log.setReadOnly(True)
+    log.setMinimumHeight(160)
+    log.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
+    outer.addWidget(log)
+
+    def _log(level: str, msg: str) -> None:
+        log.appendPlainText(f"{_now()} {level:<6} {msg}")
+
+    def refresh_layers() -> None:
+        v = _v()
+        names = ["<active image>"]
+        if v is not None:
+            for L in v.layers:
+                if isinstance(L, NapariImage):
+                    names.append(L.name)
+        cur = cmb_layer.currentText()
+        cmb_layer.blockSignals(True)
+        cmb_layer.clear()
+        cmb_layer.addItems(names)
+        if cur in names:
+            cmb_layer.setCurrentText(cur)
+        else:
+            cmb_layer.setCurrentIndex(0)
+        cmb_layer.blockSignals(False)
+
+    def pick_layer() -> Optional[NapariImage]:
+        v = _v()
+        if v is None:
+            return None
+        name = cmb_layer.currentText()
+
+        if name == "<active image>":
+            lyr = getattr(v.layers.selection, "active", None)
+            if isinstance(lyr, NapariImage):
+                return lyr
+            for L in reversed(list(v.layers)):
+                if isinstance(L, NapariImage):
+                    return L
+            return None
+
+        for L in v.layers:
+            if isinstance(L, NapariImage) and L.name == name:
+                return L
+        return None
+
+    def is_preview() -> bool:
+        return cmb_mode.currentText().lower().startswith("preview")
+
+    def overwrite() -> bool:
+        return cmb_out.currentText().lower().startswith("overwrite")
+
+    def guard_volume(vox: int) -> None:
+        if is_preview():
+            return
+        if vox > _FULL_ABS_MAX_VOXELS:
+            raise RuntimeError(
+                f"Refused: volume too large ({vox:,} voxels). Absolute max is {_FULL_ABS_MAX_VOXELS:,}."
             )
-        except Exception:
-            pass
-    else:
-        console = Label(label="", value="(Console unavailable: magicgui TextEdit missing)")
+        if (not chk_allow_huge.isChecked()) and vox > _FULL_SAFE_VOXELS:
+            raise RuntimeError(
+                f"Refused (Full mode): {vox:,} voxels exceeds safe limit {_FULL_SAFE_VOXELS:,}. "
+                f"Use Preview or enable 'Allow huge (unsafe)'."
+            )
 
-    def ts() -> str:
-        return datetime.now().strftime("[%H:%M:%S]")
+    def make_input(layer: NapariImage) -> tuple[np.ndarray, int]:
+        arr = _ensure_2d_or_3d(np.asarray(layer.data))
+        vox = _voxels(arr)
+        guard_volume(vox)
 
-    def log(level: str, msg: str) -> None:
-        line = f"{ts()} {level:<7} {msg}"
+        if is_preview():
+            s = _downsample_stride_for_target(vox, _PREVIEW_TARGET_VOXELS)
+            return _downsample(arr, s), s
+
+        return arr, 1
+
+    def _insert_above(viewer, src_layer, new_layer) -> None:
+        """Ensure result is ABOVE the source in layer list."""
         try:
-            native = getattr(console, "native", None)
-            if native is not None and hasattr(native, "appendPlainText"):
-                native.appendPlainText(line)
-                return
-            if native is not None and hasattr(native, "append"):
-                native.append(line)
-                return
-        except Exception:
-            pass
-
-        try:
-            old = getattr(console, "value", "") or ""
-            console.value = (old + "\n" + line) if old else line
-        except Exception:
-            pass
-
-    def is_overwrite() -> bool:
-        return str(output_combo.value or "").lower().startswith("overwrite")
-
-    def apply_filtered_list(query: str) -> None:
-        q = (query or "").strip().lower()
-        if not q:
-            filtered = ALL_KEYS
-        else:
-            filtered = [k for k in ALL_KEYS if q in k.lower()]
-        if not filtered:
-            filtered = ["(no matches)"]
-        cur = func_combo.value
-        func_combo.choices = filtered
-        if cur in filtered:
-            func_combo.value = cur
-        else:
-            func_combo.value = filtered[0]
-        count_label.value = "Showing 0 functions" if filtered == ["(no matches)"] else f"Showing {len(filtered)} functions"
-
-    if search_box is not None:
-        def _on_search_change(evt=None):
-            apply_filtered_list(getattr(search_box, "value", "") or "")
-        try:
-            search_box.changed.connect(_on_search_change)
+            idx = list(viewer.layers).index(src_layer)
+            viewer.layers.move(viewer.layers.index(new_layer), idx + 1)
         except Exception:
             pass
 
-    def run_selected(evt=None) -> None:
-        refresh_layers()
+    def _apply_output(layer: NapariImage, out_arr: np.ndarray, job: _Job) -> str:
+        v = _v()
+        if v is None:
+            return layer.name
 
-        key = func_combo.value
-        if not key or key == "(no matches)":
-            show_warning("No function selected.")
-            log("WARN", "No function selected.")
-            return
-
-        entry = NORMAL_FUNCTIONS.get(key)
-        if entry is None:
-            show_error(f"Function not found: {key}")
-            log("ERROR", f"Function not found: {key}")
-            return
-
-        layer = _pick_layer_by_name(layer_combo.value)
-        if layer is None:
-            show_warning("No Image layer found. Load/select an image first.")
-            log("WARN", "No Image layer found.")
-            return
-
-        overwrite = is_overwrite()
-        log("INFO", f"Running: {entry.label} on '{layer.name}' ({'overwrite' if overwrite else 'new layer'})")
-
-        try:
-            result = entry.runner(layer)
-        except Exception as e:  # noqa: BLE001
-            show_error(f"Failed: {entry.label}\n{e!r}")
-            log("ERROR", f"{entry.label} failed: {e!r}")
-            return
-
-        if not isinstance(result, np.ndarray):
-            show_info(f"Done: {entry.label} (no output layer).")
-            log("OK", f"Done: {entry.label} (no output layer).")
-            return
-
-        if overwrite:
+        if job.output == "overwrite":
+            layer.data = out_arr
+            _reset_contrast(layer)
             try:
-                layer.data = result
-                _reset_contrast(layer, result)
-            except Exception as e:
-                show_error(f"Overwrite failed: {e!r}")
-                log("ERROR", f"Overwrite failed: {e!r}")
-                return
-            show_info(f"Done: {entry.label} (overwritten).")
-            log("OK", f"Done: {entry.label} (overwritten).")
-        else:
-            new_layer = _add_result_layer(result, layer, entry.label)
-            try:
-                layer.visible = False
+                layer.metadata = dict(layer.metadata) if isinstance(layer.metadata, dict) else {}
+                layer.metadata["p3d_last_op"] = {
+                    "op": job.op, "mode": job.mode, "stride": job.stride,
+                    "minvol": job.minvol, "preset": job.preset,
+                }
             except Exception:
                 pass
-            show_info(f"Done: {entry.label} → '{new_layer.name}' (previous hidden).")
-            log("OK", f"Done: {entry.label} → '{new_layer.name}' (previous hidden).")
+            try:
+                v.layers.selection.active = layer
+            except Exception:
+                pass
+            show_info(f"Done: {job.op} (overwritten)")
+            _log("OK", f"Done: {job.op} (overwrite)")
+            return layer.name
 
-    try:
-        run_btn.clicked.connect(run_selected)
-    except Exception:
+        extra = f"(s={job.stride})" if job.stride > 1 else ""
+        new_name = _short_name(job.src_name, job.op, job.mode, extra=extra)
+
+        # ✅ IMPORTANT: mask-ish outputs become Labels overlay, not Image
+        if _is_maskish(job.op):
+            labels = _to_labels_array(out_arr)
+            new_layer = v.add_labels(labels, name=new_name)
+            # overlay feel
+            try:
+                new_layer.opacity = 0.70
+                new_layer.contour = 1
+            except Exception:
+                pass
+        else:
+            new_layer = v.add_image(out_arr, name=new_name)
+
+        # ✅ Fix tiny/misplaced preview: copy transforms AND scale*stride
+        _inherit_transform_and_fix_stride(layer, new_layer, job.stride)
+
+        # Make sure it is ABOVE the source in layer list
+        _insert_above(v, layer, new_layer)
+
+        # Keep source visible (so you don't get "black screen")
         try:
-            run_btn.changed.connect(run_selected)
+            layer.visible = True
         except Exception:
             pass
 
-    widgets: List[object] = [header, layer_combo, search_label]
-    if search_box is not None:
-        widgets.append(search_box)
-    widgets.extend([count_label, func_label, func_combo, output_label, output_combo, run_btn, console_title])
+        # Metadata
+        try:
+            new_layer.metadata = dict(new_layer.metadata) if isinstance(new_layer.metadata, dict) else {}
+            new_layer.metadata["p3d_op"] = {
+                "op": job.op,
+                "mode": job.mode,
+                "stride": job.stride,
+                "source": job.src_name,
+                "minvol": job.minvol,
+                "preset": job.preset,
+            }
+            new_layer.metadata["_pypore3d_result"] = True
+        except Exception:
+            pass
 
-    root = Container(widgets=widgets, layout="vertical", labels=False)
-    try:
-        root.append(console)
-    except Exception:
-        pass
+        try:
+            v.layers.selection.active = new_layer
+        except Exception:
+            pass
 
-    try:
-        lay = root.native.layout()
-        if lay is not None:
-            lay.setContentsMargins(8, 8, 8, 8)
-            lay.setSpacing(8)
-    except Exception:
-        pass
+        show_info(f"Done: {job.op} → {new_name}")
+        _log("OK", f"Done: {job.op} → '{new_name}'")
+        return new_layer.name
 
-    log("INFO", "Functions tab ready (SAFE MODE: uint8 only).")
+    def _record_step(op_name: str, src_layer: NapariImage, result_layer_name: str, params: Dict[str, Any], notes: str = ""):
+        p = dict(params)
+        p["result_layer"] = str(result_layer_name)
+        RECORDER.add_step(op=op_name, target=src_layer.name, params=p, notes=notes)
+
+    def run_job(op: str, runner: Callable[[np.ndarray], np.ndarray], *, minvol: int = 0) -> None:
+        refresh_layers()
+        layer = pick_layer()
+        if layer is None:
+            show_warning("No Image layer selected.")
+            _log("WARN", "No Image layer selected.")
+            return
+
+        try:
+            in_arr, stride = make_input(layer)
+        except Exception as e:
+            show_error(str(e))
+            _log("ERROR", str(e))
+            return
+
+        mode = "preview" if is_preview() else "full"
+        out_mode = "overwrite" if overwrite() else "new"
+        allow_huge = bool(chk_allow_huge.isChecked())
+        vox = _voxels(np.asarray(layer.data))
+        _log("INFO", f"Run {op} on '{layer.name}' | mode={mode} | voxels={vox:,} | stride={stride} | out={out_mode}")
+
+        job = _Job(
+            op=op,
+            fn=lambda: runner(in_arr),
+            mode=mode,
+            stride=stride,
+            src_name=layer.name,
+            output=out_mode,
+            minvol=int(minvol),
+            allow_huge=allow_huge,
+        )
+
+        def _do() -> np.ndarray:
+            return job.fn()
+
+        def _on_done(out_arr: np.ndarray) -> None:
+            try:
+                result_name = _apply_output(layer, out_arr, job)
+                _record_step(
+                    "p3d_run",
+                    layer,
+                    result_name,
+                    params={
+                        "algo": job.op,
+                        "mode": job.mode,
+                        "stride": int(job.stride),
+                        "output": job.output,
+                        "allow_huge": bool(job.allow_huge),
+                        "minvol": int(job.minvol),
+                    },
+                )
+            except Exception as e:
+                show_error(f"Apply output failed: {e!r}")
+                _log("ERROR", f"Apply output failed: {e!r}")
+
+        def _on_err(err: Any) -> None:
+            show_error(f"{op} failed: {err!r}")
+            _log("ERROR", f"{op} failed: {err!r}")
+
+        if thread_worker is None:
+            try:
+                _on_done(_do())
+            except Exception as e:
+                _on_err(e)
+            return
+
+        worker = thread_worker(_do)()
+        worker.returned.connect(_on_done)
+        worker.errored.connect(lambda e: _on_err(e))  # type: ignore
+        worker.start()
+
+    # ---- ops
+    def op_median():
+        run_job("Median", lambda a: _run_filt_u8(a, "MedianFilter8", py_p3dMedianFilter8))
+
+    def op_mean():
+        run_job("Mean", lambda a: _run_filt_u8(a, "MeanFilter8", py_p3dMeanFilter8))
+
+    def op_gauss():
+        run_job("Gaussian", lambda a: _run_filt_u8(a, "GaussianFilter8", py_p3dGaussianFilter8))
+
+    def op_thresh():
+        run_job("AutoThreshold", lambda a: _run_filt_u8(a, "AutoThresholding8", py_p3dAutoThresholding8))
+
+    def op_clear():
+        run_job("ClearBorder", lambda a: _run_filt_u8(a, "ClearBorderFilter8", py_p3dClearBorderFilter8))
+
+    def op_minvol():
+        mv = int(spn_minvol.value())
+        run_job(f"MinVol({mv})", lambda a: _run_minvol_u8(a, mv), minvol=mv)
+
+    def op_label():
+        run_job("BlobLabeling", lambda a: _run_blob_label_u8(a))
+
+    # ---- presets
+    def preset_fast_mask():
+        refresh_layers()
+        layer = pick_layer()
+        if layer is None:
+            show_warning("No Image layer selected.")
+            _log("WARN", "No Image layer selected.")
+            return
+
+        mv = int(spn_minvol.value())
+        mode = "preview" if is_preview() else "full"
+        out_mode = "overwrite" if overwrite() else "new"
+        allow_huge = bool(chk_allow_huge.isChecked())
+
+        try:
+            in_arr, stride = make_input(layer)
+        except Exception as e:
+            show_error(str(e))
+            _log("ERROR", str(e))
+            return
+
+        _log("INFO", f"Preset: fast mask | mode={mode} | stride={stride} | minvol={mv} | out={out_mode}")
+
+        job = _Job(
+            op="PresetFastMask",
+            fn=lambda: in_arr,
+            mode=mode,
+            stride=stride,
+            src_name=layer.name,
+            output=out_mode,
+            minvol=mv,
+            allow_huge=allow_huge,
+            preset="fast_mask",
+        )
+
+        def _pipeline() -> np.ndarray:
+            a1 = _run_filt_u8(in_arr, "AutoThresholding8", py_p3dAutoThresholding8)
+            a2 = _run_minvol_u8(a1, mv)
+            a3 = _run_filt_u8(a2, "ClearBorderFilter8", py_p3dClearBorderFilter8)
+            return a3
+
+        def _on_done(out: np.ndarray) -> None:
+            try:
+                result_name = _apply_output(layer, out, job)
+                _record_step(
+                    "p3d_preset_fast_mask",
+                    layer,
+                    result_name,
+                    params={
+                        "mode": mode,
+                        "stride": int(stride),
+                        "output": out_mode,
+                        "allow_huge": bool(allow_huge),
+                        "minvol": int(mv),
+                    },
+                )
+            except Exception as e:
+                show_error(f"Preset apply failed: {e!r}")
+                _log("ERROR", f"Preset apply failed: {e!r}")
+
+        def _on_err(err: Any) -> None:
+            show_error(f"Preset failed: {err!r}")
+            _log("ERROR", f"Preset failed: {err!r}")
+
+        if thread_worker is None:
+            try:
+                _on_done(_pipeline())
+            except Exception as e:
+                _on_err(e)
+            return
+
+        worker = thread_worker(_pipeline)()
+        worker.returned.connect(_on_done)
+        worker.errored.connect(lambda e: _on_err(e))  # type: ignore
+        worker.start()
+
+    def preset_clean_label():
+        refresh_layers()
+        layer = pick_layer()
+        if layer is None:
+            show_warning("No Image layer selected.")
+            _log("WARN", "No Image layer selected.")
+            return
+
+        mv = int(spn_minvol.value())
+        mode = "preview" if is_preview() else "full"
+        out_mode = "overwrite" if overwrite() else "new"
+        allow_huge = bool(chk_allow_huge.isChecked())
+
+        try:
+            in_arr, stride = make_input(layer)
+        except Exception as e:
+            show_error(str(e))
+            _log("ERROR", str(e))
+            return
+
+        _log("INFO", f"Preset: clean+label | mode={mode} | stride={stride} | minvol={mv} | out={out_mode}")
+
+        job = _Job(
+            op="PresetCleanLabel",
+            fn=lambda: in_arr,
+            mode=mode,
+            stride=stride,
+            src_name=layer.name,
+            output=out_mode,
+            minvol=mv,
+            allow_huge=allow_huge,
+            preset="clean_label",
+        )
+
+        def _pipeline() -> np.ndarray:
+            a1 = _run_minvol_u8(in_arr, mv)
+            a2 = _run_filt_u8(a1, "ClearBorderFilter8", py_p3dClearBorderFilter8)
+            a3 = _run_blob_label_u8(a2)
+            return a3
+
+        def _on_done(out: np.ndarray) -> None:
+            try:
+                result_name = _apply_output(layer, out, job)
+                _record_step(
+                    "p3d_preset_clean_label",
+                    layer,
+                    result_name,
+                    params={
+                        "mode": mode,
+                        "stride": int(stride),
+                        "output": out_mode,
+                        "allow_huge": bool(allow_huge),
+                        "minvol": int(mv),
+                    },
+                )
+            except Exception as e:
+                show_error(f"Preset apply failed: {e!r}")
+                _log("ERROR", f"Preset apply failed: {e!r}")
+
+        def _on_err(err: Any) -> None:
+            show_error(f"Preset failed: {err!r}")
+            _log("ERROR", f"Preset failed: {err!r}")
+
+        if thread_worker is None:
+            try:
+                _on_done(_pipeline())
+            except Exception as e:
+                _on_err(e)
+            return
+
+        worker = thread_worker(_pipeline)()
+        worker.returned.connect(_on_done)
+        worker.errored.connect(lambda e: _on_err(e))  # type: ignore
+        worker.start()
+
+    # wire buttons
+    btn_median.clicked.connect(op_median)
+    btn_mean.clicked.connect(op_mean)
+    btn_gauss.clicked.connect(op_gauss)
+    btn_thresh.clicked.connect(op_thresh)
+    btn_clear.clicked.connect(op_clear)
+    btn_minvol.clicked.connect(op_minvol)
+    btn_label.clicked.connect(op_label)
+    btn_preset_fast.clicked.connect(preset_fast_mask)
+    btn_preset_label.clicked.connect(preset_clean_label)
+
+    refresh_layers()
+    if _HAVE_FILT and _HAVE_BLOB:
+        _log("INFO", "Ready: PyPore3D FILT + BLOB available.")
+    elif _HAVE_FILT:
+        _log("WARN", "FILT available, but BLOB missing (p3dBlobPy import failed).")
+    else:
+        _log("ERROR", "PyPore3D FILT missing (p3dFiltPy import failed).")
+
     return root
+
+# ---------------------------------------------------------------------
+# Replay handlers (recipe reproduction)
+# ---------------------------------------------------------------------
+def _find_image(viewer, name: str) -> Optional[NapariImage]:
+    for L in reversed(list(viewer.layers)):
+        if isinstance(L, NapariImage) and L.name == name:
+            return L
+    return None
+
+def _replay_apply_output(viewer, src: NapariImage, out_arr: np.ndarray, output: str, result_layer_name: str, stride: int, op: str) -> None:
+    if output == "overwrite":
+        src.data = out_arr
+        try:
+            src.reset_contrast_limits()
+        except Exception:
+            pass
+        try:
+            viewer.layers.selection.active = src
+        except Exception:
+            pass
+        return
+
+    name = str(result_layer_name) if result_layer_name else f"{src.name}_p3d"
+
+    if _is_maskish(op):
+        labels = _to_labels_array(out_arr)
+        newL = viewer.add_labels(labels, name=name)
+        try:
+            newL.opacity = 0.70
+            newL.contour = 1
+        except Exception:
+            pass
+    else:
+        newL = viewer.add_image(out_arr, name=name)
+        try:
+            newL.reset_contrast_limits()
+        except Exception:
+            pass
+
+    _inherit_transform_and_fix_stride(src, newL, stride)
+
+    # place above src
+    try:
+        idx = list(viewer.layers).index(src)
+        viewer.layers.move(viewer.layers.index(newL), idx + 1)
+    except Exception:
+        pass
+
+    try:
+        viewer.layers.selection.active = newL
+    except Exception:
+        pass
+
+def _replay_p3d_run(viewer, step: Step) -> None:
+    L = _find_image(viewer, step.target)
+    if L is None:
+        raise RuntimeError(f"p3d_run: target layer not found: {step.target}")
+
+    p = step.params or {}
+    algo = str(p.get("algo", ""))
+    mode = str(p.get("mode", "full"))
+    stride = int(p.get("stride", 1) or 1)
+    output = str(p.get("output", "new"))
+    minvol = int(p.get("minvol", 0) or 0)
+    result_name = str(p.get("result_layer") or "")
+
+    arr = _ensure_2d_or_3d(np.asarray(L.data))
+    in_arr = _downsample(arr, stride) if (mode == "preview" and stride > 1) else arr
+
+    if algo.startswith("Median"):
+        out = _run_filt_u8(in_arr, "MedianFilter8", py_p3dMedianFilter8)
+    elif algo.startswith("Mean"):
+        out = _run_filt_u8(in_arr, "MeanFilter8", py_p3dMeanFilter8)
+    elif algo.startswith("Gaussian"):
+        out = _run_filt_u8(in_arr, "GaussianFilter8", py_p3dGaussianFilter8)
+    elif algo.startswith("AutoThreshold"):
+        out = _run_filt_u8(in_arr, "AutoThresholding8", py_p3dAutoThresholding8)
+    elif algo.startswith("ClearBorder"):
+        out = _run_filt_u8(in_arr, "ClearBorderFilter8", py_p3dClearBorderFilter8)
+    elif algo.startswith("MinVol"):
+        out = _run_minvol_u8(in_arr, minvol)
+    elif algo.startswith("BlobLabeling"):
+        out = _run_blob_label_u8(in_arr)
+    else:
+        raise RuntimeError(f"p3d_run: unknown algo '{algo}'")
+
+    _replay_apply_output(viewer, L, out, output, result_name, stride=stride, op=algo)
+
+def _replay_preset_fast_mask(viewer, step: Step) -> None:
+    L = _find_image(viewer, step.target)
+    if L is None:
+        raise RuntimeError(f"p3d_preset_fast_mask: target layer not found: {step.target}")
+
+    p = step.params or {}
+    mode = str(p.get("mode", "full"))
+    stride = int(p.get("stride", 1) or 1)
+    output = str(p.get("output", "new"))
+    mv = int(p.get("minvol", 50) or 50)
+    result_name = str(p.get("result_layer") or "")
+
+    arr = _ensure_2d_or_3d(np.asarray(L.data))
+    in_arr = _downsample(arr, stride) if (mode == "preview" and stride > 1) else arr
+
+    a1 = _run_filt_u8(in_arr, "AutoThresholding8", py_p3dAutoThresholding8)
+    a2 = _run_minvol_u8(a1, mv)
+    a3 = _run_filt_u8(a2, "ClearBorderFilter8", py_p3dClearBorderFilter8)
+
+    _replay_apply_output(viewer, L, a3, output, result_name, stride=stride, op="PresetFastMask")
+
+def _replay_preset_clean_label(viewer, step: Step) -> None:
+    L = _find_image(viewer, step.target)
+    if L is None:
+        raise RuntimeError(f"p3d_preset_clean_label: target layer not found: {step.target}")
+
+    p = step.params or {}
+    mode = str(p.get("mode", "full"))
+    stride = int(p.get("stride", 1) or 1)
+    output = str(p.get("output", "new"))
+    mv = int(p.get("minvol", 50) or 50)
+    result_name = str(p.get("result_layer") or "")
+
+    arr = _ensure_2d_or_3d(np.asarray(L.data))
+    in_arr = _downsample(arr, stride) if (mode == "preview" and stride > 1) else arr
+
+    a1 = _run_minvol_u8(in_arr, mv)
+    a2 = _run_filt_u8(a1, "ClearBorderFilter8", py_p3dClearBorderFilter8)
+    a3 = _run_blob_label_u8(a2)
+
+    _replay_apply_output(viewer, L, a3, output, result_name, stride=stride, op="PresetCleanLabel")
+
+register_handler("p3d_run", _replay_p3d_run)
+register_handler("p3d_preset_fast_mask", _replay_preset_fast_mask)
+register_handler("p3d_preset_clean_label", _replay_preset_clean_label)

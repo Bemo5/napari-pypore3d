@@ -14,8 +14,8 @@ from monai.inferers import sliding_window_inference
 # =========================
 # EDIT THESE
 # =========================
-IMAGE_IN = r"napari_pypore3d\train\z35.png"
-MODEL_PT = r"models/monai_seg_4class.pt"
+IMAGE_IN = r"napari_pypore3d\images\z135.png"
+MODEL_PT = r"models\monai_seg_4class_BEST.pt"
 OUT_NPY  = r"napari_pypore3d/out/pred_mask.npy"
 
 DEVICE = "cuda"  # "cuda" or "cpu"

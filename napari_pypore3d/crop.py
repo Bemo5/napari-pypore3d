@@ -1,9 +1,9 @@
-# napari_pypore3d/crop.py — r103 (fast: debounced live preview + 3D-safe)
+# napari_pypore3d/crop.py — r105 (records into global session recorder)
 from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any
 
 from magicgui.widgets import ComboBox, RangeSlider, PushButton, CheckBox, Label, Container
 from napari import current_viewer
@@ -12,10 +12,8 @@ from napari.utils.notifications import show_info, show_warning, show_error
 
 from qtpy.QtCore import QTimer
 
+from .session_recorder import get_recorder
 
-# ---------------------------------------------------------------------------
-# Low-level helpers
-# ---------------------------------------------------------------------------
 
 def _viewer():
     try:
@@ -25,22 +23,30 @@ def _viewer():
 
 
 def _images(v) -> List[NapariImage]:
-    """Return all Image layers (2D or 3D)."""
     if v is None:
         return []
     return [l for l in v.layers if isinstance(l, NapariImage)]
 
 
 def _safe_contrast(L: NapariImage):
-    """Make sure the layer is visible with sane contrast."""
     try:
         if hasattr(L, "reset_contrast_limits"):
             L.reset_contrast_limits()
         else:
-            a = np.asarray(L.data)
-            if a.size:
-                step = max(1, a.size // 256_000)
-                samp = a.ravel()[::step].astype(float, copy=False)
+            a = L.data
+            try:
+                if getattr(a, "ndim", 0) >= 3:
+                    z = int(a.shape[-3] // 2) if int(a.shape[-3]) > 0 else 0
+                    a2 = a[..., z, :, :]
+                else:
+                    a2 = a
+            except Exception:
+                a2 = a
+
+            arr = np.asarray(a2)
+            if arr.size:
+                step = max(1, arr.size // 256_000)
+                samp = arr.ravel()[::step].astype(float, copy=False)
                 lo = float(np.nanpercentile(samp, 0.5))
                 hi = float(np.nanpercentile(samp, 99.5))
                 if (not np.isfinite(lo)) or (not np.isfinite(hi)) or hi <= lo:
@@ -49,6 +55,7 @@ def _safe_contrast(L: NapariImage):
                     if (not np.isfinite(lo)) or (not np.isfinite(hi)) or hi <= lo:
                         hi = lo + 1.0
                 L.contrast_limits = (lo, hi)
+
         L.visible = True
         L.opacity = 1.0
         try:
@@ -59,28 +66,35 @@ def _safe_contrast(L: NapariImage):
         pass
 
 
-def _shape_zyx(a: np.ndarray) -> Tuple[int, int, int]:
-    a = np.asarray(a)
-    if a.ndim == 2:
-        y, x = a.shape
-        return 1, int(y), int(x)
-    if a.ndim >= 3:
-        z, y, x = a.shape[-3], a.shape[-2], a.shape[-1]
-        return int(z), int(y), int(x)
+def _shape_zyx(a: Any) -> Tuple[int, int, int]:
+    try:
+        ndim = int(getattr(a, "ndim", 0))
+        shape = getattr(a, "shape", None)
+        if shape is None:
+            a = np.asarray(a)
+            ndim = a.ndim
+            shape = a.shape
+
+        if ndim == 2:
+            y, x = shape
+            return 1, int(y), int(x)
+        if ndim >= 3:
+            z, y, x = shape[-3], shape[-2], shape[-1]
+            return int(z), int(y), int(x)
+    except Exception:
+        pass
     return 1, 1, 1
 
 
-def _slice_zyx(a, z0, z1, y0, y1, x0, x1):
-    """Slice by Z/Y/X, preserving any leading dims."""
-    a = np.asarray(a)
-    if a.ndim == 2:
+def _slice_zyx(a: Any, z0: int, z1: int, y0: int, y1: int, x0: int, x1: int):
+    ndim = int(getattr(a, "ndim", 0))
+    if ndim == 2:
         return a[y0:y1, x0:x1]
-    pre = (slice(None),) * (a.ndim - 3)
+    pre = (slice(None),) * (ndim - 3)
     return a[pre + (slice(z0, z1), slice(y0, y1), slice(x0, x1))]
 
 
 def _as_int_pair(v) -> Tuple[int, int]:
-    """RangeSlider may return floats; force to safe ints."""
     a, b = v
     a = int(round(float(a)))
     b = int(round(float(b)))
@@ -97,10 +111,6 @@ def _clamp_pair(a: int, b: int, lo: int, hi: int) -> Tuple[int, int]:
     return a, b
 
 
-# ---------------------------------------------------------------------------
-# Controller
-# ---------------------------------------------------------------------------
-
 @dataclass
 class CropCtrl:
     pick: ComboBox
@@ -115,6 +125,7 @@ class CropCtrl:
     busy: bool = False
     _timer: Optional[QTimer] = None
     _warned_3d: bool = False
+    _attached_viewer_id: Optional[int] = None
 
     def _get_viewer(self):
         return _viewer()
@@ -145,18 +156,43 @@ class CropCtrl:
         return L if isinstance(L, NapariImage) else None
 
     # ---------- full-volume storage ----------
-
     def _ensure_full(self, L: NapariImage):
         md = L.metadata
         if "_orig_full" not in md:
-            md["_orig_full"] = np.asarray(L.data)
+            md["_orig_full"] = L.data  # keep lazy types lazy
 
-    def _full(self, L: NapariImage) -> np.ndarray:
-        full = L.metadata.get("_orig_full")
-        return full if isinstance(full, np.ndarray) else np.asarray(L.data)
+    def _full(self, L: NapariImage):
+        full = L.metadata.get("_orig_full", None)
+        return full if full is not None else L.data
+
+    # ---------- recorder helpers ----------
+    def _crop_params_for(self, L: NapariImage) -> dict:
+        full = self._full(L)
+        z, y, x = _shape_zyx(full)
+
+        z0, z1 = _as_int_pair(self.rz.value)
+        y0, y1 = _as_int_pair(self.ry.value)
+        x0, x1 = _as_int_pair(self.rx.value)
+
+        z0, z1 = _clamp_pair(z0, z1, 0, max(0, z - 1))
+        y0, y1 = _clamp_pair(y0, y1, 0, max(0, y - 1))
+        x0, x1 = _clamp_pair(x0, x1, 0, max(0, x - 1))
+
+        return {"z0": z0, "z1": z1, "y0": y0, "y1": y1, "x0": x0, "x1": x1}
+
+    def _record_crop(self, L: NapariImage):
+        try:
+            get_recorder().add_step(op="crop_zyx", target=L.name, params=self._crop_params_for(L))
+        except Exception:
+            pass
+
+    def _record_reset(self, L: NapariImage):
+        try:
+            get_recorder().add_step(op="crop_reset", target=L.name, params={})
+        except Exception:
+            pass
 
     # ---------- slider sync ----------
-
     def _sync_sliders_to_layer(self, L: Optional[NapariImage]):
         if L is None:
             return
@@ -177,7 +213,6 @@ class CropCtrl:
         self.rx.value = (0, self.rx.max)
 
     # ---------- core ops ----------
-
     def _crop_single(self, L: NapariImage):
         self._ensure_full(L)
         full = self._full(L)
@@ -200,7 +235,6 @@ class CropCtrl:
         _safe_contrast(L)
 
     # ---------- debounced live preview ----------
-
     def _ensure_timer(self):
         if self._timer is None:
             self._timer = QTimer()
@@ -212,7 +246,6 @@ class CropCtrl:
             return
         self.busy = True
         try:
-            # Live preview is 2D-only
             if self._is_3d():
                 return
             L = self._get_target()
@@ -222,7 +255,6 @@ class CropCtrl:
             self.busy = False
 
     # ---------- UI callbacks ----------
-
     def apply(self, *_):
         if self.busy:
             return
@@ -240,6 +272,7 @@ class CropCtrl:
                     return
                 for L in imgs:
                     self._crop_single(L)
+                    self._record_crop(L)
                 show_info("Crop applied to ALL images.")
             else:
                 L = self._get_target()
@@ -247,6 +280,7 @@ class CropCtrl:
                     show_warning("No image selected.")
                     return
                 self._crop_single(L)
+                self._record_crop(L)
                 show_info(f"Cropped '{L.name}'.")
         except Exception as e:
             show_error(f"Crop failed: {e!r}")
@@ -265,6 +299,7 @@ class CropCtrl:
             if bool(self.apply_all.value):
                 for L in _images(v):
                     self._reset_single(L)
+                    self._record_reset(L)
                 show_info("Reset ALL images.")
                 self._sync_sliders_to_layer(self._get_target())
             else:
@@ -272,6 +307,7 @@ class CropCtrl:
                 if not L:
                     return
                 self._reset_single(L)
+                self._record_reset(L)
                 self._sync_sliders_to_layer(L)
                 show_info(f"Reset '{L.name}'.")
         except Exception as e:
@@ -280,13 +316,11 @@ class CropCtrl:
             self.busy = False
 
     def live_crop(self, *_):
-        """Debounced live preview (2D only)."""
         try:
             if not bool(self.live_preview.value):
                 return
 
             if self._is_3d():
-                # auto-disable; 3D live updates rebuild rendering and kill UI
                 if not self._warned_3d:
                     show_warning("Live preview disabled in 3D (too slow). Use 'Apply crop'.")
                     self._warned_3d = True
@@ -298,7 +332,6 @@ class CropCtrl:
 
             self._warned_3d = False
             self._ensure_timer()
-            # debounce: restart timer while dragging
             self._timer.start(150)
         except Exception:
             pass
@@ -326,9 +359,42 @@ class CropCtrl:
         finally:
             self.busy = False
 
+    def on_active_changed(self, *_):
+        try:
+            if self.pick.value != "Active (auto)":
+                return
+            self._sync_sliders_to_layer(self._get_target())
+        except Exception:
+            pass
+
+    def attach_to_viewer(self, v):
+        if v is None:
+            return
+        vid = id(v)
+        if self._attached_viewer_id == vid:
+            return
+        self._attached_viewer_id = vid
+
+        for ev_name in ("inserted", "removed", "reordered"):
+            try:
+                getattr(v.layers.events, ev_name).connect(self.on_layers_changed)
+            except Exception:
+                pass
+
+        try:
+            v.layers.selection.events.active.connect(self.on_active_changed)
+        except Exception:
+            try:
+                v.layers.selection.events.changed.connect(self.on_active_changed)
+            except Exception:
+                pass
+
+        try:
+            v.dims.events.ndisplay.connect(self.live_crop)
+        except Exception:
+            pass
+
     def connect(self):
-        """Wire widget callbacks using Qt-native signals (reliable)."""
-        # Buttons
         try:
             self.b_apply.native.clicked.connect(lambda *_: self.apply())
         except Exception:
@@ -339,29 +405,22 @@ class CropCtrl:
         except Exception:
             self.b_reset.changed.connect(self.reset)
 
-        # Sliders (debounced)
         for rs in (self.rz, self.ry, self.rx):
             try:
                 rs.native.valueChanged.connect(lambda *_: self.live_crop())
             except Exception:
                 rs.changed.connect(self.live_crop)
 
-        # Picker
         try:
             self.pick.native.currentTextChanged.connect(lambda *_: self.on_layers_changed())
         except Exception:
             self.pick.changed.connect(self.on_layers_changed)
 
-        # Live preview toggle (if user turns it on while already in 3D, disable)
         try:
             self.live_preview.changed.connect(self.live_crop)
         except Exception:
             pass
 
-
-# ---------------------------------------------------------------------------
-# Public factory
-# ---------------------------------------------------------------------------
 
 def make_crop_panel():
     pick = ComboBox(name="Target image", choices=["Active (auto)"], value="Active (auto)")
@@ -398,7 +457,10 @@ def make_crop_panel():
     )
 
     try:
+        v = _viewer()
+        ctrl.attach_to_viewer(v)
         ctrl.on_layers_changed()
+        ctrl.on_active_changed()
     except Exception:
         pass
 

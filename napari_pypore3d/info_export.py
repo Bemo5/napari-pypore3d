@@ -1,35 +1,24 @@
-# napari_pypore3d/info_export.py — r37
-# ---------------------------------------------------------------------
-# Info panel (shows active image details) + Export tools:
-#  • Save as .npy
-#  • Save as .tif (if tifffile installed)
-#  • Save as .raw (little-endian; pick dtype)
-#
-# Public API:
-#   build_info_export_panel(settings) -> (QWidget, Callable[[], None])
-#     - QWidget: panel you can add to a tab
-#     - Callable: refresh() to re-read active image & update fields
-#
+# napari_pypore3d/info_export.py — r38
 from __future__ import annotations
+
 from typing import Callable, Optional, Dict
 import pathlib
 import numpy as np
+import json
 
 from qtpy.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
-    QPushButton, QFileDialog, QComboBox, QSizePolicy
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QFileDialog, QComboBox, QSizePolicy,
+    QListWidget, QListWidgetItem, QFrame
 )
 from qtpy.QtCore import Qt
+from qtpy.QtGui import QFont
 from napari import current_viewer
 from napari.layers import Image as NapariImage
 from napari.utils.notifications import show_info, show_warning, show_error
 
-# helpers from the package
-from .helpers import (
-    array_stats,
-    voxel,
-    export_raw_little,
-)
+from .helpers import export_raw_little
+from .session_recorder import SessionRecorder
 
 # optional tifffile
 try:
@@ -56,65 +45,100 @@ _DTYPE_MAP = {
 }
 
 
-def _fmt_tuple(t) -> str:
-    try:
-        return str(tuple(int(x) for x in t))
-    except Exception:
-        return str(tuple(t))
+def _get_or_make_recorder(settings) -> SessionRecorder:
+    """
+    Store the recorder in _settings so every tab can log steps into the same stack.
+    Supports dict-like or attribute-like settings.
+    """
+    if settings is None:
+        # fallback global instance
+        if not hasattr(_get_or_make_recorder, "_global"):
+            _get_or_make_recorder._global = SessionRecorder()  # type: ignore
+        return _get_or_make_recorder._global  # type: ignore
 
+    # dict-like
+    if isinstance(settings, dict):
+        rec = settings.get("session_recorder")
+        if isinstance(rec, SessionRecorder):
+            return rec
+        rec = SessionRecorder()
+        settings["session_recorder"] = rec
+        return rec
 
-def _layer_summary(L: NapariImage) -> Dict[str, str]:
-    a = np.asarray(L.data)
-    st = array_stats(a)
-    vs = voxel(L)
-    path = L.metadata.get("_file_path", "")
-    cl_txt = ""
+    # attribute-like
+    rec = getattr(settings, "session_recorder", None)
+    if isinstance(rec, SessionRecorder):
+        return rec
+    rec = SessionRecorder()
     try:
-        lo, hi = L.contrast_limits if L.contrast_limits is not None else (None, None)
-        if lo is not None and hi is not None:
-            cl_txt = f"[{float(lo):.6g}, {float(hi):.6g}]"
+        setattr(settings, "session_recorder", rec)
     except Exception:
-        cl_txt = ""
-    return {
-        "name": L.name,
-        "shape": _fmt_tuple(a.shape),
-        "dtype": getattr(a.dtype, "name", str(a.dtype)),
-        "min": f"{st['min']:.6g}",
-        "max": f"{st['max']:.6g}",
-        "mean": f"{st['mean']:.6g}",
-        "std": f"{st['std']:.6g}",
-        "voxel": _fmt_tuple(vs) if vs else "—",
-        "contrast": cl_txt or "—",
-        "path": str(path) if path else "—",
-    }
+        pass
+    return rec
 
 
 def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
-    """
-    Create the Info / Export tab and a refresh() function.
-    """
-
-    # --- UI skeleton
     root = QWidget()
     root.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
     vbox = QVBoxLayout(root)
 
-    grid = QGridLayout()
-    grid.setVerticalSpacing(4)
-    labels_left = [
-        "Layer", "Shape", "Dtype", "Min", "Max", "Mean", "Std",
-        "Voxel size (z,y,x)", "Contrast limits", "Source path"
-    ]
-    value_labels: Dict[str, QLabel] = {}
-    for i, key in enumerate(labels_left):
-        grid.addWidget(QLabel(key + ":"), i, 0, Qt.AlignRight)
-        lab = QLabel("—")
-        lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        value_labels[key] = lab
-        grid.addWidget(lab, i, 1)
-    vbox.addLayout(grid)
+    rec = _get_or_make_recorder(_settings)
 
-    # --- export row (.npy / .tif / .raw)
+    # ---------------------------
+    # Session / Recipe section
+    # ---------------------------
+    title = QLabel("Session Recipe (reproducible stack)")
+    f = QFont()
+    f.setPointSize(11)
+    f.setBold(True)
+    title.setFont(f)
+    vbox.addWidget(title)
+
+    hint = QLabel(
+        "This records *plugin actions* (buttons you press). "
+        "Save as JSON, replay later, or copy a replay script."
+    )
+    hint.setWordWrap(True)
+    hint.setStyleSheet("opacity: 0.85;")
+    vbox.addWidget(hint)
+
+    steps_list = QListWidget()
+    steps_list.setSelectionMode(QListWidget.SingleSelection)
+    vbox.addWidget(steps_list, stretch=1)
+
+    row_recipe = QHBoxLayout()
+    btn_copy = QPushButton("Copy replay script")
+    btn_save_recipe = QPushButton("Save recipe (.json)")
+    btn_load_recipe = QPushButton("Load recipe (.json)")
+    btn_replay = QPushButton("Replay recipe")
+    btn_clear = QPushButton("Clear stack")
+    row_recipe.addWidget(btn_copy)
+    row_recipe.addWidget(btn_save_recipe)
+    row_recipe.addWidget(btn_load_recipe)
+    row_recipe.addWidget(btn_replay)
+    row_recipe.addWidget(btn_clear)
+    row_recipe.addStretch(1)
+    vbox.addLayout(row_recipe)
+
+    # optional snapshot: guarantees exact state but can be huge
+    row_snap = QHBoxLayout()
+    btn_snapshot = QPushButton("Save snapshot (.npz) (exact but large)")
+    row_snap.addWidget(btn_snapshot)
+    row_snap.addStretch(1)
+    vbox.addLayout(row_snap)
+
+    line = QFrame()
+    line.setFrameShape(QFrame.HLine)
+    line.setFrameShadow(QFrame.Sunken)
+    vbox.addWidget(line)
+
+    # ---------------------------
+    # Export section (keep yours)
+    # ---------------------------
+    export_title = QLabel("Export active Image layer")
+    export_title.setFont(f)
+    vbox.addWidget(export_title)
+
     row = QHBoxLayout()
     btn_npy = QPushButton("Save as .npy")
     btn_tif = QPushButton("Save as .tif")
@@ -135,19 +159,9 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
     vbox.addLayout(row)
 
     # --------------------------------------------------------
-    # behavior
+    # helpers
     # --------------------------------------------------------
-
-    def _clear_fields() -> None:
-        for lab in value_labels.values():
-            lab.setText("—")
-
     def _find_image_layer() -> Optional[NapariImage]:
-        """
-        VERY dumb but very reliable:
-        - get current viewer
-        - return top-most Image layer if any
-        """
         try:
             viewer = current_viewer()
         except Exception:
@@ -155,74 +169,172 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
         if viewer is None:
             return None
 
-        # Prefer active_layer if it's an Image
         lyr = getattr(viewer, "active_layer", None)
         if isinstance(lyr, NapariImage):
             return lyr
 
-        # Otherwise pick the last Image layer (top-most)
         for L in reversed(list(viewer.layers)):
             if isinstance(L, NapariImage):
                 return L
         return None
 
-    def refresh() -> None:
-        try:
-            viewer = current_viewer()
-        except Exception:
-            viewer = None
-
-        if viewer is None:
-            _clear_fields()
-            value_labels["Layer"].setText("No viewer")
-            return
-
-        L = _find_image_layer()
-        if not isinstance(L, NapariImage):
-            _clear_fields()
-            value_labels["Layer"].setText(f"No Image layer (total layers: {len(viewer.layers)})")
-            return
-
-        try:
-            info = _layer_summary(L)
-        except Exception as e:
-            _clear_fields()
-            value_labels["Layer"].setText(f"Error reading layer '{L.name}'")
-            show_warning(f"Info panel: failed to read layer '{L.name}': {e}")
-            return
-
-        value_labels["Layer"].setText(info["name"])
-        value_labels["Shape"].setText(info["shape"])
-        value_labels["Dtype"].setText(info["dtype"])
-        value_labels["Min"].setText(info["min"])
-        value_labels["Max"].setText(info["max"])
-        value_labels["Mean"].setText(info["mean"])
-        value_labels["Std"].setText(info["std"])
-        value_labels["Voxel size (z,y,x)"].setText(info["voxel"])
-        value_labels["Contrast limits"].setText(info["contrast"])
-        value_labels["Source path"].setText(info["path"])
-
-    def _pick_save_path(suffix: str, title: str) -> Optional[pathlib.Path]:
+    def _pick_save_path(suffix: str, title: str, default_name: str = "output") -> Optional[pathlib.Path]:
         default_dir = ""
         L = _find_image_layer()
         if L:
             p = L.metadata.get("_file_path")
             if p:
                 default_dir = str(pathlib.Path(p).parent)
+            default_name = L.name
+
         fn, _ = QFileDialog.getSaveFileName(
             None,
             title,
-            str(pathlib.Path(default_dir) / f"{value_labels['Layer'].text()}{suffix}"),
+            str(pathlib.Path(default_dir) / f"{default_name}{suffix}"),
             f"{suffix[1:].upper()} files (*{suffix});;All files (*)",
         )
         return pathlib.Path(fn) if fn else None
 
+    # --------------------------------------------------------
+    # refresh UI
+    # --------------------------------------------------------
+    def refresh() -> None:
+        steps_list.clear()
+        steps = rec.steps()
+        if not steps:
+            steps_list.addItem(QListWidgetItem("— no recorded steps yet —"))
+            return
+        for s in steps:
+            txt = f"{s.idx:03d}) {s.op} | target: {s.target}"
+            if s.params:
+                txt += f" | {json.dumps(s.params, ensure_ascii=False)}"
+            if s.notes:
+                txt += f" | note: {s.notes}"
+            steps_list.addItem(QListWidgetItem(txt))
+
+    rec.changed.connect(refresh)
+    refresh()
+
+    # --------------------------------------------------------
+    # recipe buttons
+    # --------------------------------------------------------
+    def _on_save_recipe():
+        path = _pick_save_path(".json", "Save recipe as .json", default_name="recipe")
+        if not path:
+            return
+        try:
+            path.write_text(rec.dumps_json_text(indent=2), encoding="utf-8")
+            show_info(f"Saved recipe: {path.name}")
+        except Exception as e:
+            show_error(f"Save recipe failed: {e}")
+
+    def _on_load_recipe():
+        fn, _ = QFileDialog.getOpenFileName(
+            None,
+            "Load recipe (.json)",
+            "",
+            "JSON files (*.json);;All files (*)",
+        )
+        if not fn:
+            return
+        try:
+            text = pathlib.Path(fn).read_text(encoding="utf-8")
+            rec.loads_json_text(text)
+            show_info(f"Loaded recipe: {pathlib.Path(fn).name}")
+        except Exception as e:
+            show_error(f"Load recipe failed: {e}")
+
+    def _on_copy_script():
+        path_hint = "recipe.json"
+        try:
+            script = rec.make_replay_script(recipe_path=path_hint)
+            from qtpy.QtWidgets import QApplication
+            QApplication.clipboard().setText(script)
+            show_info("Copied replay script to clipboard (expects recipe.json in cwd).")
+        except Exception as e:
+            show_error(f"Copy failed: {e}")
+
+    def _on_replay():
+        try:
+            viewer = current_viewer()
+        except Exception:
+            viewer = None
+        if viewer is None:
+            show_warning("Replay: no active napari viewer.")
+            return
+        try:
+            rec.replay(viewer, strict=True)
+            show_info("Replay done ✅")
+        except Exception as e:
+            show_error(f"Replay failed: {e}")
+
+    def _on_clear():
+        rec.clear()
+        show_info("Cleared recipe stack.")
+
+    btn_save_recipe.clicked.connect(_on_save_recipe)
+    btn_load_recipe.clicked.connect(_on_load_recipe)
+    btn_copy.clicked.connect(_on_copy_script)
+    btn_replay.clicked.connect(_on_replay)
+    btn_clear.clicked.connect(_on_clear)
+
+    # --------------------------------------------------------
+    # snapshot export (exact reproducibility, big files)
+    # --------------------------------------------------------
+    def _on_snapshot():
+        try:
+            viewer = current_viewer()
+        except Exception:
+            viewer = None
+        if viewer is None:
+            show_warning("Snapshot: no active napari viewer.")
+            return
+
+        path = _pick_save_path(".npz", "Save snapshot as .npz", default_name="session_snapshot")
+        if not path:
+            return
+
+        try:
+            imgs = [L for L in viewer.layers if isinstance(L, NapariImage)]
+            if not imgs:
+                show_warning("Snapshot: no Image layers to save.")
+                return
+
+            arrays = {}
+            meta = []
+            for i, L in enumerate(imgs):
+                key = f"img_{i:03d}"
+                arrays[key] = np.asarray(L.data)
+                meta.append({
+                    "key": key,
+                    "name": L.name,
+                    "dtype": str(np.asarray(L.data).dtype),
+                    "shape": tuple(np.asarray(L.data).shape),
+                    "metadata": dict(L.metadata) if isinstance(L.metadata, dict) else {},
+                })
+
+            # Save arrays + metadata + recipe
+            np.savez_compressed(
+                path,
+                **arrays,
+                __meta__=np.array([json.dumps(meta, ensure_ascii=False)]),
+                __recipe__=np.array([rec.dumps_json_text(indent=2)]),
+            )
+            show_info(f"Saved snapshot: {path.name}")
+        except Exception as e:
+            show_error(f"Snapshot save failed: {e}")
+
+    btn_snapshot.clicked.connect(_on_snapshot)
+
+    # --------------------------------------------------------
+    # Export behavior (same as before)
+    # --------------------------------------------------------
     def _on_save_npy():
         L = _find_image_layer()
         if not L:
-            show_warning("Info / Export: no Image layer to save.")
+            show_warning("Export: no Image layer to save.")
             return
-        path = _pick_save_path(".npy", "Save array as .npy")
+        path = _pick_save_path(".npy", "Save array as .npy", default_name=L.name)
         if not path:
             return
         try:
@@ -236,9 +348,9 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
             return
         L = _find_image_layer()
         if not L:
-            show_warning("Info / Export: no Image layer to save.")
+            show_warning("Export: no Image layer to save.")
             return
-        path = _pick_save_path(".tif", "Save array as .tif")
+        path = _pick_save_path(".tif", "Save array as .tif", default_name=L.name)
         if not path:
             return
         try:
@@ -251,9 +363,9 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
     def _on_save_raw():
         L = _find_image_layer()
         if not L:
-            show_warning("Info / Export: no Image layer to save.")
+            show_warning("Export: no Image layer to save.")
             return
-        path = _pick_save_path(".raw", "Save array as .raw (little-endian)")
+        path = _pick_save_path(".raw", "Save array as .raw (little-endian)", default_name=L.name)
         if not path:
             return
         try:
@@ -267,25 +379,4 @@ def build_info_export_panel(_settings) -> tuple[QWidget, Callable[[], None]]:
     btn_tif.clicked.connect(_on_save_tif)
     btn_raw.clicked.connect(_on_save_raw)
 
-    # --- auto-refresh on viewer events (best-effort)
-    try:
-        viewer = current_viewer()
-    except Exception:
-        viewer = None
-
-    if viewer is not None:
-        # active layer changed
-        try:
-            viewer.layers.selection.events.active.connect(lambda e=None: refresh())
-        except Exception:
-            pass
-        # layers added / removed
-        try:
-            viewer.layers.events.inserted.connect(lambda e=None: refresh())
-            viewer.layers.events.removed.connect(lambda e=None: refresh())
-        except Exception:
-            pass
-
-    # initial paint
-    refresh()
     return root, refresh
