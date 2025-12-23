@@ -635,6 +635,14 @@ def raw_loader_widget() -> QWidget:
     from .view3d import _make_view3d_tab
     view3d_tab = _make_view3d_tab()
     view3d_tab_index = tabs.addTab(view3d_tab, "3D View")
+    # --- Session tab (always built, very light) ---
+    try:
+        session_panel = make_session_recorder_panel() if make_session_recorder_panel else QWidget()
+    except Exception:
+        session_panel = QWidget()
+
+    session_tab = _pad(session_panel)
+    session_tab_index = tabs.addTab(session_tab, "Session")
 
     # ------------------------------------------------------------------
     # HEAVY TABS: Plot / Export / Functions / Brush / MONAI → LAZY BUILT
