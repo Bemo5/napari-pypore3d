@@ -246,13 +246,14 @@ class CropCtrl:
             return
         self.busy = True
         try:
-            if self._is_3d():
+            if self._is_3d() and not bool(self.allow_3d.value):
                 return
             L = self._get_target()
             if L is not None:
                 self._crop_single(L)
         finally:
             self.busy = False
+
 
     # ---------- UI callbacks ----------
     def apply(self, *_):
@@ -320,14 +321,15 @@ class CropCtrl:
             if not bool(self.live_preview.value):
                 return
 
-            if self._is_3d():
+            if self._is_3d() and not bool(self.allow_3d.value):
                 if not self._warned_3d:
-                    show_warning("Live preview disabled in 3D (too slow). Use 'Apply crop'.")
+                    show_warning(
+                        "Live preview in 3D is disabled by default.\n"
+                        "Enable 'Allow live preview in 3D (OWN RISK)' if you know what you're doing."
+                    )
                     self._warned_3d = True
-                try:
-                    self.live_preview.value = False
-                except Exception:
-                    pass
+                return
+
                 return
 
             self._warned_3d = False
@@ -429,6 +431,10 @@ def make_crop_panel():
     rx = RangeSlider(name="X", min=0, max=0, value=(0, 0))
 
     live_preview = CheckBox(text="Live preview (2D only)", value=False)
+    allow_3d = CheckBox(
+    text="Allow live preview in 3D (OWN RISK)",
+    value=False,
+)
     apply_all = CheckBox(text="Apply to ALL images", value=False)
     b_apply = PushButton(text="Apply crop")
     b_reset = PushButton(text="Reset")
@@ -443,6 +449,7 @@ def make_crop_panel():
         b_apply=b_apply,
         b_reset=b_reset,
     )
+    ctrl.allow_3d = allow_3d   # ← attach dynamically
     ctrl.connect()
 
     panel = Container(
@@ -450,6 +457,7 @@ def make_crop_panel():
             Label(value="Crop (FULL volume — Z / Y / X)"),
             pick, rz, ry, rx,
             live_preview,
+            allow_3d,
             apply_all, b_apply, b_reset,
         ],
         layout="vertical",
