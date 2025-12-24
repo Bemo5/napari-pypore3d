@@ -15,6 +15,10 @@ from qtpy.QtCore import QTimer
 from .session_recorder import get_recorder
 
 
+# ---------------------------------------------------------------------
+# Viewer helpers
+# ---------------------------------------------------------------------
+
 def _viewer():
     try:
         return current_viewer()
@@ -27,6 +31,10 @@ def _images(v) -> List[NapariImage]:
         return []
     return [l for l in v.layers if isinstance(l, NapariImage)]
 
+
+# ---------------------------------------------------------------------
+# Contrast helper (UNCHANGED)
+# ---------------------------------------------------------------------
 
 def _safe_contrast(L: NapariImage):
     try:
@@ -65,6 +73,10 @@ def _safe_contrast(L: NapariImage):
     except Exception:
         pass
 
+
+# ---------------------------------------------------------------------
+# Shape + slicing helpers (UNCHANGED)
+# ---------------------------------------------------------------------
 
 def _shape_zyx(a: Any) -> Tuple[int, int, int]:
     try:
@@ -111,12 +123,17 @@ def _clamp_pair(a: int, b: int, lo: int, hi: int) -> Tuple[int, int]:
     return a, b
 
 
+# ---------------------------------------------------------------------
+# Controller (LOGIC UNCHANGED)
+# ---------------------------------------------------------------------
+
 @dataclass
 class CropCtrl:
     pick: ComboBox
     rz: RangeSlider
     ry: RangeSlider
     rx: RangeSlider
+
     live_preview: CheckBox
     apply_all: CheckBox
     b_apply: PushButton
@@ -159,7 +176,7 @@ class CropCtrl:
     def _ensure_full(self, L: NapariImage):
         md = L.metadata
         if "_orig_full" not in md:
-            md["_orig_full"] = L.data  # keep lazy types lazy
+            md["_orig_full"] = L.data
 
     def _full(self, L: NapariImage):
         full = L.metadata.get("_orig_full", None)
@@ -254,7 +271,6 @@ class CropCtrl:
         finally:
             self.busy = False
 
-
     # ---------- UI callbacks ----------
     def apply(self, *_):
         if self.busy:
@@ -328,8 +344,6 @@ class CropCtrl:
                         "Enable 'Allow live preview in 3D (OWN RISK)' if you know what you're doing."
                     )
                     self._warned_3d = True
-                return
-
                 return
 
             self._warned_3d = False
@@ -424,18 +438,33 @@ class CropCtrl:
             pass
 
 
+# ---------------------------------------------------------------------
+# Panel construction (UI only)
+# ---------------------------------------------------------------------
+
 def make_crop_panel():
     pick = ComboBox(name="Target image", choices=["Active (auto)"], value="Active (auto)")
-    rz = RangeSlider(name="Z", min=0, max=0, value=(0, 0))
-    ry = RangeSlider(name="Y", min=0, max=0, value=(0, 0))
-    rx = RangeSlider(name="X", min=0, max=0, value=(0, 0))
+
+    rz = RangeSlider(name="Z range", min=0, max=0, value=(0, 0))
+    ry = RangeSlider(name="Y range", min=0, max=0, value=(0, 0))
+    rx = RangeSlider(name="X range", min=0, max=0, value=(0, 0))
+
+    # Hide built-in numbers (buggy)
+    rz.show_value = False
+    ry.show_value = False
+    rx.show_value = False
+    rz.show_limits = False
+    ry.show_limits = False
+    rx.show_limits = False
+
+    z_label = Label(value="Z: –")
+    y_label = Label(value="Y: –")
+    x_label = Label(value="X: –")
 
     live_preview = CheckBox(text="Live preview (2D only)", value=False)
-    allow_3d = CheckBox(
-    text="Allow live preview in 3D (OWN RISK)",
-    value=False,
-)
+    allow_3d = CheckBox(text="Allow live preview in 3D (OWN RISK)", value=False)
     apply_all = CheckBox(text="Apply to ALL images", value=False)
+
     b_apply = PushButton(text="Apply crop")
     b_reset = PushButton(text="Reset")
 
@@ -449,16 +478,49 @@ def make_crop_panel():
         b_apply=b_apply,
         b_reset=b_reset,
     )
-    ctrl.allow_3d = allow_3d   # ← attach dynamically
+    ctrl.allow_3d = allow_3d
     ctrl.connect()
+
+    def _update_labels():
+        z0, z1 = map(int, rz.value)
+        y0, y1 = map(int, ry.value)
+        x0, x1 = map(int, rx.value)
+        z_label.value = f"Z: {z0} – {z1}"
+        y_label.value = f"Y: {y0} – {y1}"
+        x_label.value = f"X: {x0} – {x1}"
+
+    rz.changed.connect(_update_labels)
+    ry.changed.connect(_update_labels)
+    rx.changed.connect(_update_labels)
+
+    _update_labels()
+
+    axes_box = Container(
+        widgets=[
+            Label(value="<b>Crop axes</b>"),
+            rz, z_label,
+            ry, y_label,
+            rx, x_label,
+        ],
+        layout="vertical",
+        labels=False,
+    )
+    axes_box.native.setStyleSheet(
+        "QWidget { border: 1px solid #444; border-radius: 6px; padding: 6px; }"
+    )
+
+    header = Label(value="<b>Crop Volume</b><br><small>Z / Y / X — non-destructive</small>")
 
     panel = Container(
         widgets=[
-            Label(value="Crop (FULL volume — Z / Y / X)"),
-            pick, rz, ry, rx,
+            header,
+            Label(value="<b>Target</b>"),
+            pick,
+            axes_box,
             live_preview,
             allow_3d,
-            apply_all, b_apply, b_reset,
+            apply_all,
+            Container(widgets=[b_apply, b_reset], layout="horizontal", labels=False),
         ],
         layout="vertical",
         labels=False,
