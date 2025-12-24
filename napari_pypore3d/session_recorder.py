@@ -15,16 +15,18 @@
 # ---------------------------------------------------------------------
 
 from __future__ import annotations
-import numpy as np
+
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
-
 import json
+
+import numpy as np
 
 from napari import current_viewer
 from napari.utils.notifications import show_info, show_warning, show_error
 
+# Handler signature: handler(viewer, step)
 Handler = Callable[[Any, "Step"], None]
 _HANDLERS: Dict[str, Handler] = {}
 
@@ -40,7 +42,10 @@ class Step:
 
 def register_handler(op: str, fn: Handler) -> None:
     """Register (or replace) a replay handler for a given op name."""
-    _HANDLERS[str(op)] = fn
+    op = str(op).strip()
+    if not op:
+        return
+    _HANDLERS[op] = fn
 
 
 def _now_iso() -> str:
@@ -54,6 +59,13 @@ class Recorder:
 
         # External UI listeners (no args) – used by recorder_panel.py
         self._listeners: List[Callable[[], None]] = []
+
+        # Guard: don't re-record while replaying
+        self._replaying: bool = False
+
+    @property
+    def is_replaying(self) -> bool:
+        return bool(self._replaying)
 
     # -------------------------
     # Listeners (for live UI)
@@ -94,6 +106,10 @@ class Recorder:
         params: Optional[Dict[str, Any]] = None,
         notes: str = "",
     ) -> None:
+        """Record a step (unless currently replaying)."""
+        if self._replaying:
+            return
+
         st = Step(
             op=str(op),
             target=str(target),
@@ -103,6 +119,10 @@ class Recorder:
         )
         self.steps.append(st)
         self._notify()
+
+    # convenience alias (some files like to call .record)
+    def record(self, op: str, target: str, params: Optional[Dict[str, Any]] = None, notes: str = "") -> None:
+        self.add_step(op=op, target=target, params=params, notes=notes)
 
     def clear(self) -> None:
         self.steps.clear()
@@ -118,29 +138,35 @@ class Recorder:
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
 
-    def load_dict(self, d: Dict[str, Any]) -> None:
+    def load_dict(self, d: Dict[str, Any], *, replace: bool = True) -> None:
         steps_in = d.get("steps", [])
         out: List[Step] = []
-        for s in steps_in:
-            if not isinstance(s, dict):
-                continue
-            out.append(
-                Step(
-                    op=str(s.get("op", "")),
-                    target=str(s.get("target", "")),
-                    params=dict(s.get("params", {}) or {}),
-                    notes=str(s.get("notes", "") or ""),
-                    ts=str(s.get("ts", "") or ""),
+        if isinstance(steps_in, list):
+            for s in steps_in:
+                if not isinstance(s, dict):
+                    continue
+                out.append(
+                    Step(
+                        op=str(s.get("op", "")),
+                        target=str(s.get("target", "")),
+                        params=dict(s.get("params", {}) or {}),
+                        notes=str(s.get("notes", "") or ""),
+                        ts=str(s.get("ts", "") or ""),
+                    )
                 )
-            )
-        self.steps = out
+
+        if replace:
+            self.steps = out
+        else:
+            self.steps.extend(out)
+
         self._notify()
 
-    def load_json(self, text: str) -> None:
+    def load_json(self, text: str, *, replace: bool = True) -> None:
         d = json.loads(text)
         if not isinstance(d, dict):
             raise ValueError("Invalid recipe JSON")
-        self.load_dict(d)
+        self.load_dict(d, replace=replace)
 
     def replay(self, viewer=None) -> None:
         v = viewer
@@ -157,41 +183,44 @@ class Recorder:
             show_warning("Recipe is empty.")
             return
 
-        for step in self.steps:
-            fn = _HANDLERS.get(step.op)
-            if fn is None:
-                raise RuntimeError(f"No handler registered for op '{step.op}'")
-            fn(v, step)
+        self._replaying = True
+        try:
+            for step in self.steps:
+                fn = _HANDLERS.get(step.op)
+                if fn is None:
+                    raise RuntimeError(f"No handler registered for op '{step.op}'")
+                fn(v, step)
 
-        show_info(f"Replayed {len(self.steps)} step(s).")
+            show_info(f"Replayed {len(self.steps)} step(s).")
+        finally:
+            self._replaying = False
 
 
 # -------------------------
 # Global singleton API
 # -------------------------
 RECORDER = Recorder()
-# ----------------------------
-# Global singleton helpers
-# ----------------------------
+
 
 def get_recorder() -> Recorder:
     """Return the global recorder singleton used by the plugin."""
     return RECORDER
 
 
-def reset_global_recorder() -> Recorder:
-    """Clear the global recorder (used when the dock widget is re-created)."""
+def reset_global_recorder() -> None:
+    """
+    Clear the global recorder.
+    IMPORTANT: do NOT replace RECORDER object (other modules keep references).
+    """
     try:
         RECORDER.clear()
     except Exception:
         pass
-    return RECORDER
 
 
 # ----------------------------
 # Built-in replay handlers
 # ----------------------------
-
 def _find_layer_by_name(viewer, name: str):
     if not viewer:
         return None
@@ -217,12 +246,15 @@ def _parse_crop_params(params: dict, shape_zyx):
     Z, Y, X = map(int, shape_zyx)
 
     # style A: start + size
+    z0 = y0 = x0 = 0
+    z1, y1, x1 = Z, Y, X
+
     for a, b in (("start_zyx", "size_zyx"), ("crop_start_zyx", "crop_size_zyx")):
         if a in params and b in params:
-            sz = list(map(int, params[a]))
-            ss = list(map(int, params[b]))
-            z0, y0, x0 = sz
-            dz, dy, dx = ss
+            start = list(map(int, params[a]))
+            size = list(map(int, params[b]))
+            z0, y0, x0 = start
+            dz, dy, dx = size
             z1, y1, x1 = z0 + dz, y0 + dy, x0 + dx
             break
     else:
@@ -235,7 +267,7 @@ def _parse_crop_params(params: dict, shape_zyx):
             y0, y1 = map(int, yr)
             x0, x1 = map(int, xr)
         else:
-            # style C: explicit bounds (default full)
+            # style C: explicit bounds
             z0 = int(params.get("z0", 0))
             z1 = int(params.get("z1", Z))
             y0 = int(params.get("y0", 0))
@@ -244,9 +276,12 @@ def _parse_crop_params(params: dict, shape_zyx):
             x1 = int(params.get("x1", X))
 
     # normalise + clamp
-    if z1 < z0: z0, z1 = z1, z0
-    if y1 < y0: y0, y1 = y1, y0
-    if x1 < x0: x0, x1 = x1, x0
+    if z1 < z0:
+        z0, z1 = z1, z0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    if x1 < x0:
+        x0, x1 = x1, x0
 
     z0 = _clamp(z0, 0, Z)
     z1 = _clamp(z1, 0, Z)
@@ -256,9 +291,12 @@ def _parse_crop_params(params: dict, shape_zyx):
     x1 = _clamp(x1, 0, X)
 
     # avoid empty slices
-    if z1 <= z0: z1 = min(z0 + 1, Z)
-    if y1 <= y0: y1 = min(y0 + 1, Y)
-    if x1 <= x0: x1 = min(x0 + 1, X)
+    if z1 <= z0:
+        z1 = min(z0 + 1, Z)
+    if y1 <= y0:
+        y1 = min(y0 + 1, Y)
+    if x1 <= x0:
+        x1 = min(x0 + 1, X)
 
     return z0, z1, y0, y1, x0, x1
 
@@ -274,35 +312,25 @@ def _op_crop_zyx(viewer, step: Step):
 
     data = np.asarray(layer.data)
     if data.ndim == 2:
-        # treat as (1,Y,X)
         data = data[None, :, :]
-
     if data.ndim != 3:
         raise RuntimeError(f"crop_zyx: expected 3D (Z,Y,X), got shape {data.shape}")
 
     z0, z1, y0, y1, x0, x1 = _parse_crop_params(step.params or {}, data.shape)
-
     cropped = np.ascontiguousarray(data[z0:z1, y0:y1, x0:x1])
     layer.data = cropped
 
-    # best-effort contrast refresh
     try:
         if hasattr(layer, "reset_contrast_limits"):
             layer.reset_contrast_limits()
     except Exception:
         pass
 
-    show_info(f"Replayed crop_zyx on '{layer.name}': Z[{z0}:{z1}] Y[{y0}:{y1}] X[{x0}:{x1}] -> {cropped.shape}")
+    show_info(
+        f"Replayed crop_zyx on '{layer.name}': "
+        f"Z[{z0}:{z1}] Y[{y0}:{y1}] X[{x0}:{x1}] -> {cropped.shape}"
+    )
 
 
 # Register built-in op(s)
 register_handler("crop_zyx", _op_crop_zyx)
-
-
-def get_recorder() -> Recorder:
-    return RECORDER
-
-
-def reset_global_recorder() -> None:
-    # IMPORTANT: do NOT replace RECORDER object (other modules keep a reference).
-    RECORDER.clear()

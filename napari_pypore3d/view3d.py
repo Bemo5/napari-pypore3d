@@ -1,7 +1,7 @@
 # napari_pypore3d/view3d.py — 3D View tab split out from _widget.py
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import numpy as np
 from skimage.filters import threshold_otsu, threshold_multiotsu
@@ -10,13 +10,10 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QFrame,
-    QFileDialog,
-    QFormLayout,  # << added
+    QFormLayout,
 )
-from magicgui.widgets import PushButton, CheckBox, ComboBox, FloatSpinBox
+from magicgui.widgets import PushButton, ComboBox, FloatSpinBox
 from napari import current_viewer
 from napari.layers import Image as NapariImage
 from napari.utils.notifications import show_warning, show_info
@@ -30,14 +27,24 @@ try:
 except Exception:
     ndi = None  # type: ignore[assignment]
 
+# ---------------- Session Recorder integration (optional) ---------------------
+try:
+    from .session_recorder import get_recorder, register_handler
+except Exception:
+    get_recorder = None
+    register_handler = None
+
+_REC = get_recorder() if callable(get_recorder) else None
+
+def _find_image_by_name(v, name: str):
+    if not v or not name:
+        return None
+    for L in v.layers:
+        if isinstance(L, NapariImage) and getattr(L, "name", None) == name:
+            return L
+    return None
 
 def _make_view3d_tab() -> QWidget:
-    # local imports so top-level stays unchanged
-    try:
-        from qtpy.QtWidgets import QAbstractItemView
-    except Exception:
-        QAbstractItemView = None  # type: ignore[assignment]
-
     # ---------- tiny helpers ----------
     def _card(title: str, inner: QWidget) -> QFrame:
         box = QFrame()
@@ -45,7 +52,7 @@ def _make_view3d_tab() -> QWidget:
         box.setFrameShape(QFrame.StyledPanel)
         lay = QVBoxLayout(box)
         lay.setContentsMargins(20, 16, 20, 20)
-        lay.setSpacing(16)
+        lay.setSpacing(14)
         ttl = QLabel(title)
         ttl.setStyleSheet("font-weight:600; font-size: 14px;")
         lay.addWidget(ttl)
@@ -61,28 +68,10 @@ def _make_view3d_tab() -> QWidget:
         )
         return box
 
-    # ---------- Active viewer controls (apply to selected image) ----------
-    btn_toggle = PushButton(text="Toggle 2D ↔ 3D")
-    mode = ComboBox(choices=["mip", "attenuated_mip", "iso"], value="mip")
-    att = FloatSpinBox(value=0.01, min=0.01, max=0.50, step=0.01)
-    iso = FloatSpinBox(value=0.50, min=0.00, max=1.00, step=0.01)
-
-    for w in (btn_toggle.native, mode.native, att.native, iso.native):
-        try:
-            w.setMinimumWidth(130)  # a bit smaller so they don't fight for width
-            w.setMinimumHeight(30)
-        except Exception:
-            pass
-    try:
-        btn_toggle.native.setMinimumHeight(40)
-        btn_toggle.native.setStyleSheet("font-weight: bold;")
-    except Exception:
-        pass
-
-    # Log widget for messages
+    # ---------- Log widget for messages (moved to bottom) ----------
     log_text = QLabel("")
     log_text.setWordWrap(True)
-    log_text.setMinimumHeight(100)
+    log_text.setMinimumHeight(120)
     log_text.setStyleSheet(
         """
         QLabel {
@@ -108,8 +97,29 @@ def _make_view3d_tab() -> QWidget:
             new_text = current_text + "\n" + new_text
         log_text.setText(new_text)
 
-        # Auto-scroll to show latest
-        log_text.setAlignment(log_text.alignment() | 0x0080)  # AlignBottom
+        # best-effort: keep latest visible (QLabel doesn't truly scroll)
+        try:
+            log_text.setAlignment(log_text.alignment() | 0x0080)  # AlignBottom
+        except Exception:
+            pass
+
+    # ---------- Active viewer controls (apply to selected image) ----------
+    btn_toggle = PushButton(text="Toggle 2D ↔ 3D")
+    mode = ComboBox(choices=["mip", "attenuated_mip", "iso"], value="mip")
+    att = FloatSpinBox(value=0.01, min=0.01, max=0.50, step=0.01)
+    iso = FloatSpinBox(value=0.50, min=0.00, max=1.00, step=0.01)
+
+    for w in (btn_toggle.native, mode.native, att.native, iso.native):
+        try:
+            w.setMinimumWidth(130)
+            w.setMinimumHeight(30)
+        except Exception:
+            pass
+    try:
+        btn_toggle.native.setMinimumHeight(40)
+        btn_toggle.native.setStyleSheet("font-weight: bold;")
+    except Exception:
+        pass
 
     def _toggle(*_):
         v = current_viewer()
@@ -118,6 +128,17 @@ def _make_view3d_tab() -> QWidget:
         v.dims.ndisplay = 3 if v.dims.ndisplay == 2 else 2
         _apply_grid(v)
         _log_message(f"Toggled display to {v.dims.ndisplay}D")
+
+        # record
+        if _REC is not None:
+            try:
+                _REC.add_step(
+                    "view3d_toggle_ndisplay",
+                    target="viewer",
+                    params={"ndisplay": int(v.dims.ndisplay)},
+                )
+            except Exception:
+                pass
 
     btn_toggle.changed.connect(_toggle)
 
@@ -138,11 +159,25 @@ def _make_view3d_tab() -> QWidget:
                 f"Applied {mode.value} render with attenuation={att.value:.3f}, iso={iso.value:.3f}"
             )
 
+            # record
+            if _REC is not None:
+                try:
+                    _REC.add_step(
+                        "view3d_apply_active_render",
+                        target=str(getattr(lyr, "name", "")),
+                        params={
+                            "rendering": str(mode.value),
+                            "attenuation": float(att.value),
+                            "iso_threshold": float(iso.value),
+                        },
+                    )
+                except Exception:
+                    pass
+
     mode.changed.connect(_apply_active)
     att.changed.connect(_apply_active)
     iso.changed.connect(_apply_active)
 
-    # row with the toggle button
     vc_row1 = QWidget()
     r1 = QHBoxLayout(vc_row1)
     r1.setContentsMargins(0, 4, 0, 4)
@@ -150,7 +185,6 @@ def _make_view3d_tab() -> QWidget:
     r1.addWidget(btn_toggle.native)
     r1.addStretch(1)
 
-    # NEW: form-style layout for Render / Atten / Iso Thr → vertical, not scrunched
     vc_row2 = QWidget()
     r2 = QFormLayout(vc_row2)
     r2.setContentsMargins(0, 0, 0, 0)
@@ -195,7 +229,6 @@ def _make_view3d_tab() -> QWidget:
 
         raw_data = np.asarray(img.data)
 
-        # Get threshold values
         lo = float(thresh_low.value)
         hi = float(thresh_high.value)
 
@@ -203,10 +236,8 @@ def _make_view3d_tab() -> QWidget:
             show_warning("Low threshold must be less than high threshold.")
             return
 
-        # Create binary mask
         mask = (raw_data >= lo) & (raw_data <= hi)
 
-        # Connected components labeling
         if ndi is None:
             labels = mask.astype(np.int32)
             n = int(labels.max())
@@ -218,7 +249,6 @@ def _make_view3d_tab() -> QWidget:
         else:
             labels, n = ndi.label(mask)
 
-        # Add labels layer to viewer
         layer_name = f"{img.name} [threshold {lo}-{hi}, {n} objects]"
         v.add_labels(
             labels,
@@ -233,9 +263,19 @@ def _make_view3d_tab() -> QWidget:
         _log_message(f"→ Found {n} connected components")
         _log_message(f"→ Added labels layer '{layer_name}'")
 
+        # record
+        if _REC is not None:
+            try:
+                _REC.add_step(
+                    "view3d_threshold_segment",
+                    target=str(getattr(img, "name", "")),
+                    params={"lo": float(lo), "hi": float(hi)},
+                )
+            except Exception:
+                pass
+
     btn_threshold.changed.connect(_apply_threshold)
 
-    # Layout for threshold controls
     thresh_row1 = QWidget()
     tr1 = QHBoxLayout(thresh_row1)
     tr1.setContentsMargins(0, 0, 0, 0)
@@ -246,7 +286,6 @@ def _make_view3d_tab() -> QWidget:
     tr1.addWidget(thresh_high.native)
     tr1.addStretch(1)
 
-    # Button row
     thresh_row2 = QWidget()
     tr2 = QHBoxLayout(thresh_row2)
     tr2.setContentsMargins(0, 0, 0, 0)
@@ -254,24 +293,12 @@ def _make_view3d_tab() -> QWidget:
     tr2.addWidget(btn_threshold.native)
     tr2.addStretch(1)
 
-    # Log section only (legend removed)
-    log_legend_widget = QWidget()
-    log_legend_layout = QVBoxLayout(log_legend_widget)
-    log_legend_layout.setContentsMargins(0, 0, 0, 0)
-    log_legend_layout.setSpacing(12)
-
-    log_label = QLabel("Activity Log")
-    log_label.setStyleSheet("font-weight: bold; font-size: 13px;")
-    log_legend_layout.addWidget(log_label)
-    log_legend_layout.addWidget(log_text)
-
     thresh_col = QWidget()
     tcol = QVBoxLayout(thresh_col)
     tcol.setContentsMargins(0, 0, 0, 0)
-    tcol.setSpacing(16)
+    tcol.setSpacing(14)
     tcol.addWidget(thresh_row1)
     tcol.addWidget(thresh_row2)
-    tcol.addWidget(log_legend_widget)
 
     threshold_card = _card("Threshold (Transfer Function)", thresh_col)
 
@@ -305,7 +332,6 @@ def _make_view3d_tab() -> QWidget:
         sigma = float(blur_sigma.value)
         num_classes = int(otsu_classes.value)
 
-        # Optional Gaussian blur to reduce noise
         if sigma > 0:
             try:
                 from scipy.ndimage import gaussian_filter
@@ -317,7 +343,6 @@ def _make_view3d_tab() -> QWidget:
                 _log_message(f"WARNING: Blur failed - {e}")
                 return
 
-        # Apply Otsu thresholding
         try:
             if num_classes == 2:
                 thresh = threshold_otsu(raw_data)
@@ -329,7 +354,6 @@ def _make_view3d_tab() -> QWidget:
                     f"Otsu thresholds ({num_classes} classes): "
                     f"{[f'{t:.1f}' for t in thresholds]}"
                 )
-                # Create multi-level mask (union of high classes)
                 mask = np.zeros_like(raw_data, dtype=bool)
                 for t in thresholds:
                     mask |= raw_data >= t
@@ -338,7 +362,6 @@ def _make_view3d_tab() -> QWidget:
             _log_message(f"ERROR: Otsu segmentation failed - {e}")
             return
 
-        # Connected components labeling
         if ndi is None:
             labels = mask.astype(np.int32)
             n = int(labels.max())
@@ -347,7 +370,6 @@ def _make_view3d_tab() -> QWidget:
         else:
             labels, n = ndi.label(mask)
 
-        # Add labels layer
         layer_name = f"{img.name} [otsu_{num_classes}class, {n} objects]"
         v.add_labels(
             labels,
@@ -362,9 +384,19 @@ def _make_view3d_tab() -> QWidget:
         _log_message(f"→ Found {n} connected components")
         _log_message(f"→ Added labels layer '{layer_name}'")
 
+        # record
+        if _REC is not None:
+            try:
+                _REC.add_step(
+                    "view3d_otsu_segment",
+                    target=str(getattr(img, "name", "")),
+                    params={"classes": int(num_classes), "blur_sigma": float(sigma)},
+                )
+            except Exception:
+                pass
+
     btn_otsu.changed.connect(_apply_otsu)
 
-    # Layout for Otsu controls
     otsu_row1 = QWidget()
     or1 = QHBoxLayout(otsu_row1)
     or1.setContentsMargins(0, 0, 0, 0)
@@ -385,11 +417,23 @@ def _make_view3d_tab() -> QWidget:
     otsu_col = QWidget()
     ocol = QVBoxLayout(otsu_col)
     ocol.setContentsMargins(0, 0, 0, 0)
-    ocol.setSpacing(16)
+    ocol.setSpacing(14)
     ocol.addWidget(otsu_row1)
     ocol.addWidget(otsu_row2)
 
     otsu_card = _card("Otsu Segmentation (automatic)", otsu_col)
+
+    # ---------- Activity Log card (NOW AT BOTTOM) ----------
+    log_wrap = QWidget()
+    lw = QVBoxLayout(log_wrap)
+    lw.setContentsMargins(0, 0, 0, 0)
+    lw.setSpacing(10)
+    hint = QLabel("Shows actions taken in this tab (and will replay via Session Recorder).")
+    hint.setStyleSheet("color:#9aa0a6; font-size:11px;")
+    hint.setWordWrap(True)
+    lw.addWidget(hint)
+    lw.addWidget(log_text)
+    log_card = _card("Activity Log", log_wrap)
 
     # ---------- assemble page ----------
     page = QWidget()
@@ -399,6 +443,7 @@ def _make_view3d_tab() -> QWidget:
     pv.addWidget(viewer_card)
     pv.addWidget(threshold_card)
     pv.addWidget(otsu_card)
+    pv.addWidget(log_card)     # ✅ moved down here
     pv.addStretch(1)
 
     # Initial log message
@@ -406,3 +451,121 @@ def _make_view3d_tab() -> QWidget:
     _log_message("Ready for threshold segmentation")
 
     return _pad(page)
+
+
+# ------------------- Replay handlers (Session Recorder) -----------------------
+def _replay_view3d_toggle(v, step):
+    params = getattr(step, "params", {}) or {}
+    ndisplay = int(params.get("ndisplay", 2))
+    try:
+        v.dims.ndisplay = 3 if int(ndisplay) == 3 else 2
+    except Exception:
+        pass
+    try:
+        _apply_grid(v)
+    except Exception:
+        pass
+
+
+def _replay_view3d_apply_active_render(v, step):
+    target = getattr(step, "target", "") or ""
+    params = getattr(step, "params", {}) or {}
+    lyr = _find_image_by_name(v, target)
+    if not isinstance(lyr, NapariImage):
+        return
+    for k, val in (
+        ("rendering", str(params.get("rendering", "mip"))),
+        ("attenuation", float(params.get("attenuation", 0.01))),
+        ("iso_threshold", float(params.get("iso_threshold", 0.5))),
+    ):
+        try:
+            setattr(lyr, k, val)
+        except Exception:
+            pass
+
+
+def _replay_view3d_threshold_segment(v, step):
+    target = getattr(step, "target", "") or ""
+    params = getattr(step, "params", {}) or {}
+    img = _find_image_by_name(v, target)
+    if not isinstance(img, NapariImage):
+        return
+
+    raw_data = np.asarray(img.data)
+    lo = float(params.get("lo", 50.0))
+    hi = float(params.get("hi", 200.0))
+    if lo >= hi:
+        return
+
+    mask = (raw_data >= lo) & (raw_data <= hi)
+    if ndi is None:
+        labels = mask.astype(np.int32)
+        n = int(labels.max())
+    else:
+        labels, n = ndi.label(mask)
+
+    layer_name = f"{img.name} [threshold {lo}-{hi}, {n} objects]"
+    v.add_labels(
+        labels,
+        name=layer_name,
+        blending="translucent",
+        opacity=0.7,
+        rendering="iso_categorical",
+    )
+
+
+def _replay_view3d_otsu_segment(v, step):
+    target = getattr(step, "target", "") or ""
+    params = getattr(step, "params", {}) or {}
+    img = _find_image_by_name(v, target)
+    if not isinstance(img, NapariImage):
+        return
+
+    raw_data = np.asarray(img.data, dtype=np.float32)
+    sigma = float(params.get("blur_sigma", 1.0))
+    num_classes = int(params.get("classes", 2))
+
+    if sigma > 0:
+        try:
+            from scipy.ndimage import gaussian_filter
+
+            raw_data = gaussian_filter(raw_data, sigma=sigma)
+        except Exception:
+            return
+
+    try:
+        if num_classes == 2:
+            thresh = threshold_otsu(raw_data)
+            mask = raw_data >= thresh
+        else:
+            thresholds = threshold_multiotsu(raw_data, classes=num_classes)
+            mask = np.zeros_like(raw_data, dtype=bool)
+            for t in thresholds:
+                mask |= raw_data >= t
+    except Exception:
+        return
+
+    if ndi is None:
+        labels = mask.astype(np.int32)
+        n = int(labels.max())
+    else:
+        labels, n = ndi.label(mask)
+
+    layer_name = f"{img.name} [otsu_{num_classes}class, {n} objects]"
+    v.add_labels(
+        labels,
+        name=layer_name,
+        blending="translucent",
+        opacity=0.7,
+        rendering="iso_categorical",
+    )
+
+
+if callable(register_handler):
+    try:
+        register_handler("view3d_toggle_ndisplay", _replay_view3d_toggle)
+        register_handler("view3d_apply_active_render", _replay_view3d_apply_active_render)
+        register_handler("view3d_threshold_segment", _replay_view3d_threshold_segment)
+        register_handler("view3d_otsu_segment", _replay_view3d_otsu_segment)
+    except Exception:
+        pass
