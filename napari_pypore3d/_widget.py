@@ -71,10 +71,10 @@ except Exception:
         def __init__(self, *_): pass
         def as_qwidget(self): return QWidget()
 
-try:
-    from .info_export import build_info_export_panel
-except Exception:
-    def build_info_export_panel(*_): return QWidget(), (lambda : None)
+# try:
+    # from .info_export import build_info_export_panel
+# except Exception:
+    # def build_info_export_panel(*_): return QWidget(), (lambda : None)
 
 try:
     from .titles import refresh_titles
@@ -451,6 +451,7 @@ def _add_image_from_array(arr: np.ndarray, path: str, dtype_name: str):
     _backup_orig(L); _safe_contrast(L)
     v.layers.selection.active = L
     if CENTERS_ENABLED: _ensure_center(v, L)
+    v.layers.selection.active = L
     return L
 
 def _load_one(path: str, dtype_name: str, Z:int,Y:int,X:int, prefer_memmap: bool):
@@ -653,11 +654,11 @@ def raw_loader_widget() -> QWidget:
     plot_tab_layout.setSpacing(0)
     plot_tab_index = tabs.addTab(plot_tab, "Plotting")
 
-    info_tab = QWidget()
-    info_tab_layout = QVBoxLayout(info_tab)
-    info_tab_layout.setContentsMargins(0, 0, 0, 0)
-    info_tab_layout.setSpacing(0)
-    info_tab_index = tabs.addTab(info_tab, "Export")
+    # info_tab = QWidget()
+    # info_tab_layout = QVBoxLayout(info_tab)
+    # info_tab_layout.setContentsMargins(0, 0, 0, 0)
+    # info_tab_layout.setSpacing(0)
+    # info_tab_index = tabs.addTab(info_tab, "Export")
 
     fn_tab = QWidget()
     fn_tab_layout = QVBoxLayout(fn_tab)
@@ -726,21 +727,21 @@ def raw_loader_widget() -> QWidget:
         except Exception as e:
             show_warning(f"Plot Lab failed to build: {e!r}")
 
-    def _ensure_info():
-        nonlocal info_widget, info_refresh, built_info
-        if built_info:
-            return
-        try:
-            info_w, info_ref = build_info_export_panel(s)
-            info_widget_local = info_w
-            info_refresh_local = info_ref
-            info_tab_layout.addWidget(_pad(info_widget_local))
-            info_widget = info_widget_local
-            info_refresh = info_refresh_local
-            built_info = True
-            _apply_cap_width()
-        except Exception as e:
-            show_warning(f"Info / Export page failed to build: {e!r}")
+    # def _ensure_info():
+        # nonlocal info_widget, info_refresh, built_info
+        # if built_info:
+            # return
+        # try:
+            # info_w, info_ref = build_info_export_panel(s)
+            # info_widget_local = info_w
+            # info_refresh_local = info_ref
+            # info_tab_layout.addWidget(_pad(info_widget_local))
+            # info_widget = info_widget_local
+            # info_refresh = info_refresh_local
+            # built_info = True
+            # _apply_cap_width()
+        # except Exception as e:
+            # show_warning(f"Info / Export page failed to build: {e!r}")
 
     def _ensure_functions():
         nonlocal fn_page, built_fn
@@ -790,6 +791,24 @@ def raw_loader_widget() -> QWidget:
     v = current_viewer()
     if v:
         wire_caption_events_once()
+        def _on_dims_changed(event=None):
+            if _IN_SYNC:
+                return
+            if not CENTERS_ENABLED:
+                return
+            try:
+                with _bulk(v):
+                    _update_dot_plane(v)
+            except Exception:
+                pass
+
+        # avoid wiring multiple times if widget is recreated
+        if not getattr(v, "_pypore3d_centers_wired", False):
+            try:
+                v.dims.events.current_step.connect(_on_dims_changed)
+                setattr(v, "_pypore3d_centers_wired", True)
+            except Exception:
+                pass
 
         def _on_layers(event=None, *_):
             if _IN_SYNC:
@@ -800,11 +819,11 @@ def raw_loader_widget() -> QWidget:
             if current == load_tab_index:
                 ui._refresh_loaded_list()
 
-            if current == info_tab_index and built_info:
-                try:
-                    info_refresh()
-                except Exception:
-                    pass
+            # if current == info_tab_index and built_info:
+                # try:
+                    # info_refresh()
+                # except Exception:
+                    # pass
 
         v.layers.events.inserted.connect(_on_layers)
         v.layers.events.removed.connect(_on_layers)
@@ -830,8 +849,8 @@ def raw_loader_widget() -> QWidget:
                 set_active_tab("session")
             elif idx == plot_tab_index:
                 set_active_tab("plot")
-            elif idx == info_tab_index:
-                set_active_tab("info")
+            # elif idx == info_tab_index:
+                # set_active_tab("info")
             elif idx == fn_tab_index:
                 set_active_tab("functions")
             elif idx == brush_tab_index:
@@ -849,8 +868,8 @@ def raw_loader_widget() -> QWidget:
 
             if idx == plot_tab_index:
                 _ensure_plotlab()
-            elif idx == info_tab_index:
-                _ensure_info()
+            # elif idx == info_tab_index:
+                # _ensure_info()
             elif idx == fn_tab_index:
                 _ensure_functions()
             elif idx == brush_tab_index:
