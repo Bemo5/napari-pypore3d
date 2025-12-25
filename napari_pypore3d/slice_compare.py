@@ -544,9 +544,10 @@ class SliceCompareController:
                 try:
                     _REC.add_step(
                         "slice_compare_make",
-                        target=parent.name,
+                        target="__ACTIVE__",
                         params={"z": int(self.z_spin.value()), "y": int(self.y_spin.value()), "x": int(self.x_spin.value())},
                     )
+
                 except Exception:
                     pass
         finally:
@@ -570,7 +571,7 @@ class SliceCompareController:
             # ✅ record (correct API)
             if _REC is not None:
                 try:
-                    _REC.add_step("slice_compare_clear", target=parent.name, params={})
+                    _REC.add_step("slice_compare_clear", target="__ACTIVE__", params={})
                 except Exception:
                     pass
         finally:
@@ -578,38 +579,77 @@ class SliceCompareController:
 
 
 # ---------------- replay handlers --------------------------------------------
+def _resolve_parent_for_replay(v, target: str) -> Optional[NapariImage]:
+    """
+    Replay target resolver:
+    - "__ACTIVE__" / "" -> active 3D image (or first 3D image)
+    - explicit name -> that layer, else fallback to active/first 3D image
+    """
+    t = (target or "").strip()
+
+    # active token
+    if t in ("", "__ACTIVE__", "__ANY__", "__ANY_IMAGE__", "__ANY_IMAGE__"):
+        active = v.layers.selection.active if v else None
+        if isinstance(active, NapariImage):
+            md = getattr(active, "metadata", {}) or {}
+            if (not md.get("_slice_compare", False)) and np.asarray(active.data).ndim >= 3:
+                return active
+        imgs = _images(v)
+        return imgs[0] if imgs else None
+
+    # by name
+    parent = _find_parent_by_name(v, t)
+    if parent is not None:
+        return parent
+
+    # fallback
+    active = v.layers.selection.active if v else None
+    if isinstance(active, NapariImage):
+        md = getattr(active, "metadata", {}) or {}
+        if (not md.get("_slice_compare", False)) and np.asarray(active.data).ndim >= 3:
+            return active
+    imgs = _images(v)
+    return imgs[0] if imgs else None
+
+
 def _handle_slice_compare_make(v, step):
-    # step.target is the parent layer name; indices are in step.params
     target = getattr(step, "target", "") or ""
     params = getattr(step, "params", {}) or {}
     zi = int(params.get("z", 0))
     yi = int(params.get("y", 0))
     xi = int(params.get("x", 0))
 
-    parent = _find_parent_by_name(v, target)
+    parent = _resolve_parent_for_replay(v, target)
     if parent is None:
-        show_warning(f"SliceCompare replay: target layer not found: '{target}'")
+        show_warning("SliceCompare replay: no 3D image found to apply the recipe to.")
         return
+
+    if target and target not in ("__ACTIVE__", "__ANY__", "__ANY_IMAGE__", "__ANY_IMAGE__") and parent.name != target:
+        show_warning(f"SliceCompare replay: target '{target}' not found — using '{parent.name}' instead.")
 
     _apply_slice_compare_views(v, parent, zi, yi, xi, saved_layout=None)
 
 
 def _handle_slice_compare_clear(v, step):
     target = getattr(step, "target", "") or ""
-    parent = _find_parent_by_name(v, target)
+    parent = _resolve_parent_for_replay(v, target)
     if parent is None:
-        show_warning(f"SliceCompare replay: target layer not found: '{target}'")
+        show_warning("SliceCompare replay: no 3D image found to apply the recipe to.")
         return
+
+    if target and target not in ("__ACTIVE__", "__ANY__", "__ANY_IMAGE__", "__ANY_IMAGE__") and parent.name != target:
+        show_warning(f"SliceCompare replay: target '{target}' not found — using '{parent.name}' instead.")
+
     _clear_slice_compare_views(v, parent, saved_layout=None)
 
 
+# ✅ REGISTER handlers (THIS is what your error is complaining about)
 if callable(register_handler):
     try:
         register_handler("slice_compare_make", _handle_slice_compare_make)
         register_handler("slice_compare_clear", _handle_slice_compare_clear)
     except Exception:
         pass
-
 
 # ---------------- panel factory ----------------------------------------------
 def make_slice_compare_panel() -> tuple[SliceCompareController, QWidget]:

@@ -25,6 +25,22 @@ import numpy as np
 
 from napari import current_viewer
 from napari.utils.notifications import show_info, show_warning, show_error
+import importlib
+
+_PKG = __name__.rsplit(".", 1)[0]  # "napari_pypore3d"
+
+def _lazy_import_for_op(op: str) -> None:
+    # import modules that register handlers, based on op prefix
+    if op.startswith("slice_compare_"):
+        importlib.import_module(f"{_PKG}.slice_compare")
+    elif op.startswith("crop_"):
+        importlib.import_module(f"{_PKG}.crop")
+    elif op.startswith("view3d_"):
+        importlib.import_module(f"{_PKG}.view3d")
+    elif op.startswith("brush_"):
+        importlib.import_module(f"{_PKG}.brush")
+    elif op.startswith("func_") or op.startswith("functions_"):
+        importlib.import_module(f"{_PKG}.functions")
 
 # Handler signature: handler(viewer, step)
 Handler = Callable[[Any, "Step"], None]
@@ -184,16 +200,70 @@ class Recorder:
             return
 
         self._replaying = True
+        ok = 0
+        skipped = 0
+        failed = 0
+
         try:
-            for step in self.steps:
+            for i, step in enumerate(self.steps, start=1):
                 fn = _HANDLERS.get(step.op)
                 if fn is None:
-                    raise RuntimeError(f"No handler registered for op '{step.op}'")
-                fn(v, step)
+                    show_warning(f"Replay: skipping step {i:02d} op='{step.op}' (no handler registered).")
+                    skipped += 1
+                    continue
 
-            show_info(f"Replayed {len(self.steps)} step(s).")
+                # Helpful trace so you see EXACTLY which step died
+                try:
+                    show_info(f"Replay {i:02d}/{len(self.steps)}: op='{step.op}' target='{step.target}' params={step.params}")
+                except Exception:
+                    pass
+
+                try:
+                    fn(v, step)
+                    ok += 1
+                    continue
+                except Exception as e:
+                    msg = str(e or "")
+                    lower = msg.lower()
+
+                    # Auto-fallback: if target missing, retry with __ACTIVE__
+                    if (
+                        ("target layer" in lower or "target missing" in lower or "not found" in lower)
+                        and str(step.target).strip() not in ("", "__ACTIVE__", "__ANY__", "__ANY_IMAGE__")
+                    ):
+                        try:
+                            step2 = Step(
+                                op=str(step.op),
+                                target="__ACTIVE__",
+                                params=dict(step.params or {}),
+                                notes=str(getattr(step, "notes", "") or ""),
+                                ts=str(getattr(step, "ts", "") or ""),
+                            )
+                            fn(v, step2)
+                            show_warning(
+                                f"Replay: step {i:02d} op='{step.op}' target '{step.target}' missing — used __ACTIVE__ instead."
+                            )
+                            ok += 1
+                            continue
+                        except Exception as e2:
+                            show_error(
+                                f"Replay: step {i:02d} FAILED op='{step.op}' target={step.target!r} "
+                                f"(also failed with __ACTIVE__): {e2!r}"
+                            )
+                            failed += 1
+                            continue
+
+                    # Normal failure (don’t kill the whole replay)
+                    show_error(
+                        f"Replay: step {i:02d} FAILED op='{step.op}' target={step.target!r}: {e!r}"
+                    )
+                    failed += 1
+                    continue
+
+            show_info(f"Replay done: ok={ok}, skipped={skipped}, failed={failed}.")
         finally:
             self._replaying = False
+
 
 
 # -------------------------
@@ -221,6 +291,7 @@ def reset_global_recorder() -> None:
 # ----------------------------
 # Built-in replay handlers
 # ----------------------------
+
 def _find_layer_by_name(viewer, name: str):
     if not viewer:
         return None
@@ -228,6 +299,76 @@ def _find_layer_by_name(viewer, name: str):
         if getattr(L, "name", None) == name:
             return L
     return None
+
+
+def _active_image_layer(viewer):
+    """Return the active *3D* Image layer (prefer non-slice_compare)."""
+    if viewer is None:
+        return None
+
+    try:
+        active = viewer.layers.selection.active
+    except Exception:
+        active = None
+
+    try:
+        from napari.layers import Image as NapariImage
+
+        def _is_good_3d(layer):
+            if not isinstance(layer, NapariImage):
+                return False
+            md = getattr(layer, "metadata", {}) or {}
+            if md.get("_slice_compare", False):
+                return False
+            try:
+                return np.asarray(layer.data).ndim >= 3
+            except Exception:
+                return False
+
+        # 1) if active is a good 3D layer, use it
+        if _is_good_3d(active):
+            return active
+
+        # 2) if active is a slice_compare plane, jump to its parent 3D volume
+        if isinstance(active, NapariImage):
+            md = getattr(active, "metadata", {}) or {}
+            parent_name = md.get("_slice_parent")
+            if parent_name:
+                for L in viewer.layers:
+                    if _is_good_3d(L) and getattr(L, "name", None) == parent_name:
+                        return L
+
+        # 3) fallback: last good 3D layer in the stack
+        imgs = [L for L in viewer.layers if _is_good_3d(L)]
+        return imgs[-1] if imgs else None
+
+    except Exception:
+        return active if (active is not None and hasattr(active, "data")) else None
+
+
+def resolve_target_layer(viewer, target: str):
+    """
+    Resolve Step.target to a layer.
+    - "__ACTIVE__" / "" -> active image layer
+    - layer name -> that layer, else fallback to active image layer
+    """
+    t = (target or "").strip()
+
+    if t in ("", "__ACTIVE__", "__ANY__", "__ANY_IMAGE__"):
+        layer = _active_image_layer(viewer)
+        if layer is None:
+            raise RuntimeError("No active Image layer to apply the recipe to.")
+        return layer
+
+    layer = _find_layer_by_name(viewer, t)
+    if layer is not None:
+        return layer
+
+    # fallback for old recipes when the named layer isn't present
+    layer = _active_image_layer(viewer)
+    if layer is None:
+        raise RuntimeError(f"Target layer not found ({t!r}) and no active Image layer exists.")
+    return layer
 
 
 def _clamp(v: int, lo: int, hi: int) -> int:
@@ -306,7 +447,7 @@ def _op_crop_zyx(viewer, step: Step):
     Replay handler for op='crop_zyx'.
     Expects step.target = image layer name.
     """
-    layer = _find_layer_by_name(viewer, str(step.target))
+    layer = resolve_target_layer(viewer, str(step.target))
     if layer is None:
         raise RuntimeError(f"crop_zyx: target layer not found: {step.target!r}")
 
